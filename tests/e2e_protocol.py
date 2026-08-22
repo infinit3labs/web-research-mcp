@@ -8,8 +8,14 @@ import asyncio
 import json
 import os
 import sys
+from pathlib import Path
 
-SERVER_BIN = "/Users/code/mcp-servers/web-research/bin/web-research-mcp"
+# Resolve the server launcher relative to this test file so the same test
+# works in local development, in CI on a fresh checkout, and in any other
+# execution context where the project lives somewhere other than the original
+# author's machine.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+SERVER_BIN = str(REPO_ROOT / "bin" / "web-research-mcp")
 
 
 async def run():
