@@ -2,7 +2,14 @@
 
 > A high-quality, multi-source web research MCP server for AI agents. Plug it into Claude Desktop, Hermes, Cursor, or any MCP-compatible client and get production-grade search + page-fetching across Wikipedia, arXiv, Hacker News, Stack Exchange, Crossref, Brave, Tavily, and any URL on the web.
 
-[![MCP](https://img.shields.io/badge/MCP-1.x-blue)](https://modelcontextprotocol.io) [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org) [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![MCP](https://img.shields.io/badge/MCP-1.x-blue)](https://modelcontextprotocol.io) [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org) [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE) [![GitHub stars](https://img.shields.io/github/stars/infinit3labs/web-research-mcp?style=social)](https://github.com/infinit3labs/web-research-mcp/stargazers) [![CI](https://github.com/infinit3labs/web-research-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/infinit3labs/web-research-mcp/actions/workflows/ci.yml)
+
+```bash
+# One-line install (anywhere on disk)
+git clone https://github.com/infinit3labs/web-research-mcp.git
+hermes mcp add web-research --command "$(pwd)/web-research-mcp/bin/web-research-mcp"
+# 6 of 7 tools work with zero API keys. Add Brave or Tavily to unlock general web search.
+```
 
 ---
 
@@ -28,7 +35,14 @@ All seven sources work **without any API keys**. Adding a Brave or Tavily key un
 
 ## Quick start
 
-### 1. Install with Hermes
+### Option A — `pip install` (when published)
+
+```bash
+pip install web-research-mcp
+hermes mcp add web-research --command "$(which web-research-mcp)"
+```
+
+### Option B — Clone from source
 
 ```bash
 git clone https://github.com/infinit3labs/web-research-mcp.git
@@ -38,7 +52,7 @@ hermes mcp add web-research \
 
 When prompted, accept all 7 tools. Done.
 
-### 1b. Install with Claude Desktop
+### Option C — Install with Claude Desktop
 
 Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
@@ -52,7 +66,7 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
 }
 ```
 
-### 1c. Install with Cursor / any stdio MCP client
+### Option D — Install with Cursor / any stdio MCP client
 
 ```json
 {

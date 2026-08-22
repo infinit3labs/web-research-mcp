@@ -1,0 +1,53 @@
+name: publish
+
+# Publishes to PyPI on every release using Trusted Publishing (OIDC).
+# Configure the publisher at https://pypi.org/manage/account/publishing/
+#   Owner:  infinit3labs
+#   Repo:   web-research-mcp
+#   Workflow: publish.yml
+# PyPI then issues short-lived tokens to this workflow — no long-lived API token in secrets.
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    name: Build sdist + wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tooling
+        run: python -m pip install --upgrade pip build
+
+      - name: Build
+        run: python -m build
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # required for Trusted Publishing
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        # No --password: Trusted Publishing handles auth via the OIDC token.

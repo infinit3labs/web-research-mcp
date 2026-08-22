@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/), version numbers follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- CI workflow (`.github/workflows/ci.yml`) — runs e2e test on push/PR across Python 3.10/3.11/3.12
+- PyPI Trusted Publishing workflow (`.github/workflows/publish.yml`) — publishes to PyPI on every GitHub release, no long-lived API tokens
+- Repository topics: `mcp`, `model-context-protocol`, `web-search`, `research`, `ai-agents`, `wikipedia`, `arxiv`
+- Discussions enabled
+- GitHub stars + CI badges in README
+- `pip install web-research-mcp` install path documented
+- `pyproject.toml` enriched with `readme`, `classifiers`, `project.urls`, and `keywords` for PyPI-friendliness
+
 ## [0.1.0] — 2026-08-22
 
 ### Added

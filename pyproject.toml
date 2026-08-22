@@ -1,13 +1,39 @@
 [project]
 name = "web-research-mcp"
 version = "0.1.0"
-description = "High-quality web research MCP server (multi-source, ToS-friendly, anti-bot via real APIs)"
+description = "High-quality multi-source web research MCP server: Wikipedia, arXiv, Hacker News, Stack Exchange, Crossref, Brave, Tavily, and any URL on the web."
+readme = "README.md"
 requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["mcp", "model-context-protocol", "web-search", "research", "ai-agents", "wikipedia", "arxiv", "tavily", "brave"]
+authors = [
+    { name = "infinit3labs", email = "48673137+infinit3labs@users.noreply.github.com" },
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
 dependencies = [
     "mcp>=1.0.0",
     "httpx>=0.27.0",
     "pydantic>=2.5.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/infinit3labs/web-research-mcp"
+Repository = "https://github.com/infinit3labs/web-research-mcp"
+Issues = "https://github.com/infinit3labs/web-research-mcp/issues"
+Changelog = "https://github.com/infinit3labs/web-research-mcp/blob/main/CHANGELOG.md"
+Security = "https://github.com/infinit3labs/web-research-mcp/blob/main/SECURITY.md"
 
 [project.scripts]
 web-research-mcp = "web_research.server:main"
@@ -18,3 +44,12 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/web_research"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "pyproject.toml",
+]
