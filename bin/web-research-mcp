@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Launcher for the web-research MCP server.
+# Resolves the venv from $WEB_RESEARCH_HOME (default: directory of this script),
+# then exec's the server. Hermes pipes stdin/stdout through us unchanged.
+set -euo pipefail
+
+WEB_RESEARCH_HOME="${WEB_RESEARCH_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+VENV="$WEB_RESEARCH_HOME/.venv"
+ENV_FILE="$WEB_RESEARCH_HOME/web-research.env"
+
+# Load env file if present (optional keys)
+if [[ -f "$ENV_FILE" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+    set +a
+fi
+
+# Create venv on first run if missing
+if [[ ! -x "$VENV/bin/python" ]]; then
+    echo "[web-research] booting: creating venv at $VENV" >&2
+    python3 -m venv "$VENV"
+    "$VENV/bin/pip" install --quiet --upgrade pip
+    "$VENV/bin/pip" install --quiet -e "$WEB_RESEARCH_HOME"
+else
+    # Re-sync deps in case pyproject.toml changed
+    "$VENV/bin/pip" install --quiet -e "$WEB_RESEARCH_HOME" 2>/dev/null || true
+fi
+
+exec "$VENV/bin/python" -m web_research.server
