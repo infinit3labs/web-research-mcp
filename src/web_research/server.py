@@ -6,6 +6,7 @@ Uses the modern mcp.server.mcpserver.MCPServer API (MCP SDK 1.x+).
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 from typing import Annotated
@@ -15,7 +16,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from . import providers
+from . import deep_research, providers
 
 
 app = MCPServer(
@@ -199,7 +200,7 @@ async def search_stackexchange(
     description=(
         "Search Crossref for scholarly metadata across publishers (Elsevier, Springer, Wiley, "
         "IEEE, ACM, etc.). Returns DOI, citation count, publication date, and abstract. "
-        "No API key required."
+        "Covers peer-reviewed papers that arXiv may not. No API key required."
     ),
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
 )
@@ -210,6 +211,133 @@ async def search_scholar_meta(
     async with await _new_client() as client:
         res = await providers.search_crossref(query, max_results, client)
     return _format_results(query, res, "crossref") if res else f"No Crossref results for: {query}"
+
+
+# --------------------------------------------------------------------------------------
+# Deep research tools
+# --------------------------------------------------------------------------------------
+
+@app.tool(
+    name="plan_research",
+    description=(
+        "Build a structured research plan for a complex question without executing it. "
+        "Returns the planned sub-questions, the sources recommended for each, and "
+        "estimated cost (searches + fetches). Use this when you want to review or "
+        "edit the plan before committing to the full deep-research pipeline. "
+        "Returns JSON; pass it back to the `research` tool to execute."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
+)
+async def plan_research(
+    question: Annotated[str, Field(description="The research question")],
+    depth: Annotated[
+        str,
+        Field(description="Plan breadth: 'quick' (2-3 sub-questions), 'standard' (4-6), or 'deep' (6-8)."),
+    ] = "standard",
+) -> str:
+    try:
+        plan = deep_research.build_plan(question, depth)
+    except ValueError as e:
+        return f"Error: {e}"
+    return json.dumps(plan.to_dict(), indent=2)
+
+
+@app.tool(
+    name="extract_evidence",
+    description=(
+        "Fetch a URL and extract the passages most relevant to a specific question. "
+        "Returns each passage with a short context window before/after, a relevance "
+        "score, and a character offset into the original page so citations are "
+        "verifiable. Use this when you want to drill into a specific source for "
+        "evidence on a narrow claim."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
+)
+async def extract_evidence(
+    url: Annotated[str, Field(description="HTTP(S) URL to read")],
+    question: Annotated[str, Field(description="What you're looking for on this page")],
+    max_passages: Annotated[int, Field(ge=1, le=10, default=5)] = 5,
+) -> str:
+    async with await _new_client() as client:
+        fetched = await providers.fetch_jina(url, client)
+        if fetched.get("error"):
+            return f"Error fetching {url}: {fetched['error']}"
+        evidence = deep_research.extract_evidence(
+            content=fetched.get("content", ""),
+            question=question,
+            max_passages=max_passages,
+        )
+        canonical = providers._canonical_url(url)
+        # Synthesize a single synthetic citation so callers can reference passages inline
+        fake_citation = {
+            "id": 1,
+            "url": canonical,
+            "title": fetched.get("title") or canonical,
+            "source": "fetch",
+        }
+        payload = {
+            "url": canonical,
+            "title": fetched.get("title") or canonical,
+            "length": fetched.get("length", 0),
+            "truncated": fetched.get("truncated", False),
+            "passages": [
+                {
+                    "relevance": round(e.relevance, 3),
+                    "offset": e.char_offset,
+                    "before": e.context_before,
+                    "quote": e.quote,
+                    "after": e.context_after,
+                }
+                for e in evidence
+            ],
+        }
+    return json.dumps(payload, indent=2)
+
+
+@app.tool(
+    name="research",
+    description=(
+        "Run a full deep-research pipeline on a complex question. Decomposes the question "
+        "into sub-questions, fans out across multiple sources (Wikipedia, arXiv, Hacker News, "
+        "Stack Exchange, Crossref, plus Brave/Tavily if keys are configured), fetches the top "
+        "URLs, extracts the most relevant passages, and returns a structured ResearchReport "
+        "containing: the plan, a numbered citation manifest, per-sub-question evidence "
+        "with quotes + character offsets, and a Markdown synthesis template for you to fill in. "
+        "You (the model) should write the narrative synthesis citing the [n] markers; the "
+        "server does the gathering, not the writing. Use `depth='quick'` for fast overviews, "
+        "'standard' for normal research, 'deep' for thorough multi-source investigations."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
+)
+async def research(
+    question: Annotated[str, Field(description="The research question to investigate")],
+    depth: Annotated[
+        str,
+        Field(description="Research depth: 'quick' (2-3 sub-questions, ~10 fetches), 'standard' (4-6, ~20 fetches), or 'deep' (6-8, ~32 fetches)."),
+    ] = "standard",
+) -> str:
+    try:
+        report = await deep_research.run_research(question, depth)
+    except ValueError as e:
+        return f"Error: {e}"
+    except Exception as e:
+        return f"Research pipeline failed: {type(e).__name__}: {e}"
+    d = report.to_dict()
+    # Return a two-part response: a short status header for the LLM to parse
+    # quickly, then the full structured data as JSON for machine inspection.
+    header = (
+        f"# Deep Research Complete: {question}\n\n"
+        f"**Depth:** {depth}\n"
+        f"**Sub-questions answered:** {len(d['plan']['sub_questions'])}\n"
+        f"**Sources gathered:** {len(d['citations'])}\n"
+        f"**Evidence passages:** {sum(len(v) for v in d['evidence'].values())}\n\n"
+        f"Below this line is the structured report (JSON). Use the `synthesis_template` "
+        f"to draft a cited answer; use the `evidence` field to find the exact quotes "
+        f"supporting each sub-question; use the `citations` field to build the Sources "
+        f"table — each `[n]` citation_id in your answer must reference a row there.\n\n"
+        f"---\n\n"
+    )
+    return header + json.dumps(d, indent=2)
 
 
 # --------------------------------------------------------------------------------------

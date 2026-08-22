@@ -100,6 +100,8 @@ async def run():
         expected = {
             "search_web", "fetch_url", "search_wikipedia", "search_academic",
             "search_news", "search_stackexchange", "search_scholar_meta",
+            # v0.2.0 — deep research
+            "plan_research", "extract_evidence", "research",
         }
         got = {t["name"] for t in tools}
         missing = expected - got
@@ -111,9 +113,13 @@ async def run():
             (11, "search_news",           {"query": "MCP server", "max_results": 3}),
             (12, "search_academic",       {"query": "transformer attention mechanism", "max_results": 2}),
             (13, "search_stackexchange",  {"query": "python asyncio gather", "max_results": 2, "site": "stackoverflow"}),
-            (14, "search_scholar_meta",   {"query": "diffusion models image generation", "max_results": 2}),
+            (14, "search_scholar_meta",   {"query": "CRISPR gene editing", "max_results": 2}),
             (15, "fetch_url",             {"url": "https://modelcontextprotocol.io/introduction"}),
             (16, "search_web (no keys)",  {"query": "test", "max_results": 3}),
+            # v0.2.0 — deep research
+            (20, "plan_research",         {"question": "What is retrieval augmented generation?", "depth": "quick"}),
+            (21, "extract_evidence",      {"url": "https://en.wikipedia.org/wiki/Model_Context_Protocol", "question": "what is MCP and who maintains it", "max_passages": 3}),
+            (22, "research",              {"question": "What is retrieval augmented generation?", "depth": "quick"}),
         ]
 
         print()
@@ -146,6 +152,50 @@ async def run():
                     print(f"[{cid}] {name} ✅  ({'keyless empty-state' if 'API key' in text else 'real results with keys configured'})")
                 else:
                     failures.append(f"[{cid}] {name}: unexpected keyless output: {text[:200]}")
+                continue
+
+            # Deep-research tools — must return valid JSON
+            if name in ("plan_research", "extract_evidence", "research"):
+                # `research` prepends a markdown header before the JSON — extract the JSON portion
+                json_blob = text
+                if name == "research":
+                    sep = "\n---\n\n"
+                    if sep in text:
+                        json_blob = text.split(sep, 1)[1]
+                try:
+                    parsed = json.loads(json_blob)
+                except json.JSONDecodeError as e:
+                    failures.append(f"[{cid}] {name}: invalid JSON ({e}): {text[:200]}")
+                    print(f"[{cid}] {name} ❌  invalid JSON")
+                    continue
+                # Shape checks per tool
+                if name == "plan_research":
+                    ok = (
+                        "sub_questions" in parsed
+                        and "depth" in parsed
+                        and isinstance(parsed["sub_questions"], list)
+                        and len(parsed["sub_questions"]) >= 1
+                    )
+                elif name == "extract_evidence":
+                    ok = "passages" in parsed and "url" in parsed
+                else:  # research
+                    ok = (
+                        "plan" in parsed
+                        and "citations" in parsed
+                        and "evidence" in parsed
+                        and "synthesis_template" in parsed
+                        and isinstance(parsed["citations"], list)
+                    )
+                if not ok:
+                    failures.append(f"[{cid}] {name}: wrong shape: keys={list(parsed)[:8]}")
+                    print(f"[{cid}] {name} ❌  wrong shape")
+                    continue
+                extra = ""
+                if name == "research":
+                    n_cit = len(parsed["citations"])
+                    n_ev = sum(len(v) for v in parsed["evidence"].values())
+                    extra = f" — {n_cit} citations, {n_ev} evidence passages"
+                print(f"[{cid}] {name} ✅  ({len(text):,} chars){extra}")
                 continue
 
             if "No " in text[:30] and "results" in text[:30]:

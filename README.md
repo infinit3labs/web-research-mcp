@@ -38,9 +38,11 @@ All seven sources work **without any API keys**. Adding a Brave or Tavily key un
 ### Option A — `pip install` (when published)
 
 ```bash
-pip install web-research-mcp
+pip install deep-web-research-mcp
 hermes mcp add web-research --command "$(which web-research-mcp)"
 ```
+
+> **Note on naming.** The PyPI distribution name is `deep-web-research-mcp` (so `pip install deep-web-research-mcp`), but the binary on your `PATH` after install is `web-research-mcp` (defined by `[project.scripts]` in `pyproject.toml`). That's intentional — the binary matches the local launcher `bin/web-research-mcp` and the MCP registration name `web-research`. Same package, two names.
 
 ### Option B — Clone from source
 
@@ -111,7 +113,12 @@ Ask your agent things like:
 
 ## Tools
 
-All 7 tools registered in `tools/list`:
+All 10 tools registered in `tools/list`. Tools fall into two layers:
+
+- **Search & fetch** (7 tools) — single-shot lookups. One tool, one API, one result.
+- **Deep research** (3 tools) — multi-step pipelines that plan, gather, and structure evidence. Use these when a single search isn't enough.
+
+### Search & fetch
 
 ### `search_web` — multi-source general web search
 ```python
@@ -164,6 +171,68 @@ Set `site` to any SE community: `serverfault`, `superuser`, `askubuntu`, `math`,
 search_scholar_meta(query: str, max_results: int = 5) -> str
 ```
 Returns title, DOI, citation count, publisher, publication date, abstract. Covers papers arXiv doesn't (Elsevier, Springer, Wiley, IEEE, ACM). Keyless.
+
+### Deep research
+
+These three tools compose the search/fetch primitives above into multi-step research workflows. They never call an LLM themselves — the calling model stays in charge of writing the final narrative; the server's job is to plan, gather, and structure evidence with verifiable citations.
+
+### `plan_research` — structured plan only (no fetches)
+```python
+plan_research(question: str, depth: str = "standard") -> str  # JSON
+```
+Returns a JSON research plan: sub-questions, recommended sources per sub-question, rationale, queries to run, and estimated searches + fetches. Use this when you want to inspect or modify the plan before committing to the full pipeline.
+
+- `depth`: `"quick"` (2-3 sub-questions), `"standard"` (4-6), `"deep"` (6-8)
+
+### `extract_evidence` — targeted quotes from one URL
+```python
+extract_evidence(
+    url: str,
+    question: str,
+    max_passages: int = 5,
+) -> str  # JSON
+```
+Fetches the URL via Jina, splits into paragraphs, scores each for relevance to your question, and returns the top passages. Each passage includes `before` / `quote` / `after` context, a `relevance` score (0-1), and a `offset` (character position in the source) so citations are independently verifiable.
+
+Use this when you already have a specific source and want to drill into it for evidence on a narrow claim.
+
+### `research` — full deep-research pipeline
+```python
+research(question: str, depth: str = "standard") -> str  # markdown + JSON
+```
+End-to-end research workflow:
+
+1. **Plan** — builds the sub-question plan
+2. **Fan out** — searches across the recommended sources for each sub-question in parallel
+3. **Rank** — deduplicates URLs across the whole plan, ranks them with source-aware composite scoring (Wikipedia/arXiv/Crossref 2.0×, Stack Exchange 1.7×, web search 1.5×, Hacker News 1.0×)
+4. **Fetch** — pulls the top URLs via Jina Reader
+5. **Extract** — scores paragraphs for relevance with a quality floor (filters out nav menus, link-only paragraphs, footer cruft)
+6. **Return** — emits a structured `ResearchReport`:
+
+```json
+{
+  "question": "What is retrieval augmented generation?",
+  "depth": "quick",
+  "plan": { "sub_questions": [...], "estimated_searches": 4, ... },
+  "citations": [
+    { "id": 1, "url": "...", "title": "...", "source": "wikipedia", "quotes": 2 }
+  ],
+  "evidence": {
+    "sq_def": [
+      { "citation_id": 1, "relevance": 0.78, "offset": 1234,
+        "before": "...", "quote": "...", "after": "..." }
+    ]
+  },
+  "synthesis_template": "# Research Report: ..."
+}
+```
+
+The `synthesis_template` is a Markdown skeleton with one section per sub-question plus a Sources table. **You (the model) fill in the narrative**, citing each `[n]` marker against the corresponding entry in `citations`. Every quoted passage carries a character `offset` so a reader can verify the citation against the original page.
+
+`depth` controls breadth:
+- `"quick"` — 2-3 sub-questions, ~6 fetches, ~2 minutes
+- `"standard"` — 4-6 sub-questions, ~20 fetches, ~3 minutes
+- `"deep"` — 6-8 sub-questions, ~32 fetches, ~5 minutes
 
 ---
 

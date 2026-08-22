@@ -4,14 +4,19 @@ All notable changes to this project are documented here. Format follows [Keep a 
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-08-23
+
 ### Added
-- CI workflow (`.github/workflows/ci.yml`) — runs e2e test on push/PR across Python 3.10/3.11/3.12
-- PyPI Trusted Publishing workflow (`.github/workflows/publish.yml`) — publishes to PyPI on every GitHub release, no long-lived API tokens
-- Repository topics: `mcp`, `model-context-protocol`, `web-search`, `research`, `ai-agents`, `wikipedia`, `arxiv`
-- Discussions enabled
-- GitHub stars + CI badges in README
-- `pip install web-research-mcp` install path documented
-- `pyproject.toml` enriched with `readme`, `classifiers`, `project.urls`, and `keywords` for PyPI-friendliness
+- **`plan_research`** tool — builds a structured research plan (sub-questions, recommended sources, estimated cost) without executing it, so the model can review before committing to the full pipeline. Returns JSON.
+- **`extract_evidence`** tool — fetches a URL and extracts the passages most relevant to a specific question. Returns each passage with context-before, the quote, context-after, a relevance score, and a character offset into the source page for verifiable citations.
+- **`research`** tool — full deep-research pipeline. Decomposes a question into sub-questions, fans out across the existing sources (Wikipedia, arXiv, Hacker News, Stack Exchange, Crossref, Brave, Tavily), fetches the top URLs via Jina, extracts evidence, and returns a structured `ResearchReport` containing the plan, a numbered citation manifest, per-sub-question evidence with quotes + offsets, and a Markdown synthesis template for the calling LLM to fill in.
+- **`deep_research.py` module** — heuristic question decomposition, source-aware composite ranking (rebalances Hacker News vs. authoritative sources), paragraph-level relevance scoring with quality floor (filters out nav/footer cruft), and synthesis template generation.
+- E2E protocol tests extended to cover the 3 new tools (`plan_research`, `extract_evidence`, `research`); all 10 tools pass against live APIs.
+
+### Design notes
+- The server never invokes an LLM itself. The calling model is the LLM; the server's job is to plan, gather, extract evidence, and hand the structure back. This keeps the server deterministic, keyless, and fast.
+- Every quoted evidence passage carries a character offset into the original page so citations are independently verifiable — no fabricated references.
+- Sub-question routing uses source-aware composite scoring: Wikipedia / arXiv / Crossref get a 2.0× weight, Stack Exchange 1.7×, web search 1.5×, Hacker News 1.0× (HN's high raw vote scores would otherwise crowd out authoritative sources).
 
 ## [0.1.0] — 2026-08-22
 

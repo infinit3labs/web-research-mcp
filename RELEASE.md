@@ -10,7 +10,7 @@ This project uses **PyPI Trusted Publishing** — no long-lived API tokens are s
 2. Click **"Add a new pending publisher"**
 3. Fill in:
    - **Owner:** `infinit3labs`
-   - **Repository name:** `web-research-mcp`
+   - **Repository name:** `web-research-mcp` (the GitHub repo; this is independent of the PyPI distribution name in `pyproject.toml`)
    - **Workflow filename:** `publish.yml`
    - **Environment name:** `pypi` (must match the workflow's `environment:` value)
 4. Click **Add**
@@ -49,7 +49,7 @@ gh release create v0.2.0 \
 The package becomes installable within ~1 minute as:
 
 ```bash
-pip install web-research-mcp
+pip install deep-web-research-mcp
 ```
 
 ## Pre-release versions
@@ -63,13 +63,13 @@ version = "0.2.0a1"  # or 0.2.0b1, 0.2.0rc1
 gh release create v0.2.0a1 --prerelease --title "v0.2.0a1" --notes "..."
 ```
 
-PyPI will mark it as a pre-release and `pip install web-research-mcp` will still install the latest stable. Users have to explicitly opt in with `pip install --pre`.
+PyPI will mark it as a pre-release and `pip install deep-web-research-mcp` will still install the latest stable. Users have to explicitly opt in with `pip install --pre`.
 
 ## Verifying a release
 
 ```bash
-pip index versions web-research-mcp   # all versions
-pip install --upgrade web-research-mcp # install latest
+pip index versions deep-web-research-mcp   # all versions
+pip install --upgrade deep-web-research-mcp # install latest
 web-research-mcp --help               # sanity check (will hang waiting for stdio; Ctrl-C to exit is fine)
 ```
 
