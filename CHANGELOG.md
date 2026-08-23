@@ -4,6 +4,22 @@ All notable changes to this project are documented here. Format follows [Keep a 
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-08-23
+
+### Added
+- **Typed provider interface + capability-based registry** (`providers.BaseSearchProvider`, `providers.BaseFetchProvider`, `providers.ProviderRegistry`). Each provider advertises a `Capability` (web search / reference / academic / news / community Q&A / scholarly metadata / fetch); tool handlers look providers up by name or capability instead of importing them directly. New providers slot in by registering themselves.
+- **Shared HTTP hardening module** (`net.py`) — bounded retry with full-jitter exponential backoff on 429 / 5xx / transport errors, `Retry-After` header honored, and a 2 MB response-byte cap with binary content-type guard. Centralized so retry and timeout behavior is consistent across every provider.
+- **SSRF-safe URL validation** (`net.validate_public_url`). Blocks non-`http(s)` schemes and any hostname whose `A`/`AAAA` records resolve to a private, loopback, link-local (incl. AWS / GCP / Azure cloud metadata `169.254.169.254`), multicast, reserved, or unspecified address. Applied to the Jina fetch path before any outbound call.
+- **Graceful degradation** at every layer. A provider missing its API key returns `ProviderOutcome(unavailable=True)`; a provider that fails returns `ProviderOutcome(error=..., rate_limited=...)` instead of raising. One broken source never sinks a research run.
+- **64 unit tests** covering the new surfaces (`tests/test_net.py`, `tests/test_providers.py`, `tests/test_deep_research.py`) plus `pytest` + `pytest-asyncio` declared as the `[dev]` extra.
+
+### Fixed
+- **Crossref year-only dates no longer crash.** Records with `date-parts: [[2023]]` (no month/day) used to raise `IndexError`; now formatted as `2024-03-15` when full, `2024` when year-only, `None` when missing.
+- **`_best_sq_for_evidence` is now deterministic on ties.** Tied sub-questions are broken by sub-question id, so identical inputs always route evidence to the same target across runs.
+
+### Migration
+- `server.py` and `deep_research.py` now go through the registry — `providers.search_brave(...)`, `providers.fetch_jina(...)`, etc. are gone. Call sites use `_search_by_name` / `_fetch_by_name` and consume `ProviderOutcome` / `FetchResult` (dataclass, not dict).
+
 ## [0.2.0] — 2026-08-23
 
 ### Added

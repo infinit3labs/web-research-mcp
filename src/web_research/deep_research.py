@@ -25,6 +25,7 @@ from urllib.parse import urlparse
 import httpx
 
 from . import providers
+from .providers import REGISTRY, FetchResult, ProviderOutcome, Result
 
 
 # --------------------------------------------------------------------------------------
@@ -506,57 +507,59 @@ async def _gather_search(
     sq: SubQuestion,
     max_results: int,
     client: httpx.AsyncClient,
-) -> list[providers.Result]:
-    """Fan out across the recommended sources for one sub-question."""
-    src_set = set(sq.sources)
-    primary_query = sq.queries[0] if sq.queries else sq.question
-    task_specs: list[tuple[str, Any]] = []
-    if "brave" in src_set:
-        task_specs.append(("brave", providers.search_brave(primary_query, max_results, client)))
-    if "tavily" in src_set:
-        task_specs.append(("tavily", providers.search_tavily(primary_query, max_results, client)))
-    if "wikipedia" in src_set:
-        task_specs.append(("wikipedia", providers.search_wikipedia(primary_query, max_results, client)))
-    if "arxiv" in src_set:
-        task_specs.append(("arxiv", providers.search_arxiv(primary_query, max_results, client)))
-    if "hackernews" in src_set:
-        task_specs.append(("hackernews", providers.search_hn(primary_query, max_results, client)))
-    if "stackexchange" in src_set:
-        task_specs.append(("stackexchange", providers.search_stackexchange(primary_query, max_results, client)))
-    if "crossref" in src_set:
-        task_specs.append(("crossref", providers.search_crossref(primary_query, max_results, client)))
+) -> list[Result]:
+    """Fan out across the recommended sources for one sub-question.
 
-    if not task_specs:
+    Each recommended source is looked up in the registry. A source that's
+    not registered, not available, or errors out just contributes zero
+    results — the per-provider ``BaseSearchProvider.search`` already logged
+    the cause, so the run keeps going.
+    """
+    primary_query = sq.queries[0] if sq.queries else sq.question
+
+    coros: list[tuple[str, asyncio.Future[list[Result]]]] = []
+    for source in sq.sources:
+        try:
+            provider = REGISTRY.get(source)
+        except KeyError:
+            # Plan names a source we don't have a provider for — skip quietly.
+            continue
+        coros.append((source, asyncio.ensure_future(provider.search(primary_query, max_results, client))))
+
+    if not coros:
         return []
-    outcomes = await asyncio.gather(*(t[1] for t in task_specs), return_exceptions=True)
-    results: list[providers.Result] = []
-    for (_tag, _t), outcome in zip(task_specs, outcomes):
-        # Each outcome is either a list[Result] (success) or a BaseException.
-        # We only extend on a concrete list — this satisfies Pyright and is the
-        # safe path; exceptions are silently dropped (logged at the call site).
-        if isinstance(outcome, list):
-            results.extend(outcome)
+    outcomes = await asyncio.gather(*(c[1] for c in coros), return_exceptions=True)
+    results: list[Result] = []
+    for (_tag, _future), outcome in zip(coros, outcomes):
+        # `provider.search` never raises; outcomes are either ProviderOutcome
+        # (success) or a BaseException (catastrophic — we drop on the floor).
+        if isinstance(outcome, ProviderOutcome):
+            results.extend(outcome.results)
     return results
 
 
 async def _fetch_and_extract(
-    result: providers.Result,
+    result: Result,
     sq: SubQuestion,
     max_passages: int,
     client: httpx.AsyncClient,
-) -> tuple[providers.Result | None, list[Evidence]]:
+) -> tuple[Result | None, list[Evidence]]:
     """Fetch one URL and extract evidence relevant to the sub-question."""
-    fetched = await providers.fetch_jina(result.url, client)
-    if fetched.get("error") or not fetched.get("content"):
+    try:
+        fetcher = REGISTRY.get("jina")
+    except KeyError:
+        return None, []
+    fetched = await fetcher.fetch(result.url, client)
+    if fetched.error or not fetched.content:
         return None, []
     evidence = extract_evidence(
-        content=fetched["content"],
+        content=fetched.content,
         question=sq.question + " " + " ".join(sq.queries),
         max_passages=max_passages,
     )
     # Update the result with the canonical title if Jina gave us a better one
-    if fetched.get("title") and len(fetched["title"]) > len(result.title):
-        result.title = fetched["title"]
+    if fetched.title and len(fetched.title) > len(result.title):
+        result.title = fetched.title
     return result, evidence
 
 
@@ -579,19 +582,12 @@ async def run_research(
     max_passages_per_page = max(2, cfg["fetches_per_sq"] // 2 or 2)
 
     if client_factory is None:
-        def _default_factory() -> httpx.AsyncClient:
-            return httpx.AsyncClient(
-                headers={"User-Agent": providers.USER_AGENT},
-                timeout=30.0,
-                follow_redirects=True,
-                limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
-            )
-        client_factory = _default_factory
+        client_factory = providers.new_http_client
 
     client = client_factory()
     try:
         # Phase 1: gather search results per sub-question
-        per_sq_results: dict[str, list[providers.Result]] = {}
+        per_sq_results: dict[str, list[Result]] = {}
         gather_tasks = [_gather_search(sq, max_per_source, client) for sq in plan.sub_questions]
         gathered = await asyncio.gather(*gather_tasks, return_exceptions=True)
         for sq, res in zip(plan.sub_questions, gathered):
@@ -603,7 +599,7 @@ async def run_research(
                 per_sq_results[sq.id] = []
 
         # Phase 2: dedup URLs and pick the top N to actually fetch
-        seen_urls: dict[str, providers.Result] = {}
+        seen_urls: dict[str, Result] = {}
         for sq in plan.sub_questions:
             # Pre-populate with search-engine-provided snippets as evidence fallback
             for r in per_sq_results.get(sq.id, []):
@@ -624,7 +620,7 @@ async def run_research(
             "tavily": 1.5,
             "hackernews": 1.0,
         }
-        def composite(r: providers.Result) -> float:
+        def composite(r: Result) -> float:
             base = float(r.score) if r.score else 1.0
             weight = SOURCE_WEIGHTS.get(r.source, 1.0)
             return base * weight
@@ -714,9 +710,9 @@ async def run_research(
 
 
 def _matching_sq(  # noqa: E501
-    result: providers.Result,
+    result: Result,
     plan: ResearchPlan,
-    per_sq_results: dict[str, list[providers.Result]],
+    per_sq_results: dict[str, list[Result]],
 ) -> SubQuestion:
     """Find the sub-question this result was gathered for."""
     for sq in plan.sub_questions:
@@ -732,11 +728,12 @@ def _best_sq_for_evidence(
 ) -> str:
     """Pick the sub-question with the least evidence so far (load-balance).
 
-    If `ev` is None (search-snippet fallback), still load-balance.
+    If `ev` is None (search-snippet fallback), still load-balance. Ties are
+    broken by sub-question id so the result is deterministic across runs.
     """
     if not evidence_by_sq:
         return "sq_def"
-    return min(evidence_by_sq.keys(), key=lambda k: len(evidence_by_sq[k]))
+    return min(evidence_by_sq.keys(), key=lambda k: (len(evidence_by_sq[k]), k))
 
 
 def _today_iso() -> str:

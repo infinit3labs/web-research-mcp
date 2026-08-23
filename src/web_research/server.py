@@ -1,6 +1,14 @@
 """MCP server entrypoint — registers all research tools and handles stdio transport.
 
 Uses the modern mcp.server.mcpserver.MCPServer API (MCP SDK 1.x+).
+
+All search/fetch tools go through ``providers.REGISTRY``: each tool looks up
+the providers it needs by name and calls ``.search(query, max_results, client)``
+or ``.fetch(url, client)`` on them. Providers are responsible for
+availability checks, retries, and SSRF safety; tool handlers just dispatch
+and aggregate. A single broken provider (or one with no API key configured)
+returns a `ProviderOutcome` with an error or `unavailable=True` flag — it
+never raises, so a research run survives individual source failures.
 """
 
 from __future__ import annotations
@@ -17,6 +25,7 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from . import deep_research, providers
+from .providers import REGISTRY, FetchResult, ProviderOutcome, Result
 
 
 app = MCPServer(
@@ -32,17 +41,53 @@ app = MCPServer(
 # Shared HTTP client — module-level so it can be reused across tool calls if the
 # SDK keeps the event loop alive. For stdio transport each call still pays setup.
 async def _new_client() -> httpx.AsyncClient:
-    return httpx.AsyncClient(
-        headers={"User-Agent": providers.USER_AGENT},
-        timeout=30.0,
-        follow_redirects=True,
-        limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
-    )
+    return providers.new_http_client()
+
+
+# --------------------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------------------
+
+
+async def _search_by_name(
+    name: str,
+    query: str,
+    max_results: int,
+    client: httpx.AsyncClient,
+    **kwargs,
+) -> list[Result]:
+    """Run a single registered search provider; return its results or [].
+
+    A missing/unavailable/erroring provider contributes zero results without
+    raising — that's the whole point of the registry. Per-provider stderr
+    logging already happened inside ``provider.search``.
+    """
+    try:
+        provider = REGISTRY.get(name)
+    except KeyError:
+        print(f"[web-research] no provider registered as {name!r}", file=sys.stderr, flush=True)
+        return []
+    outcome: ProviderOutcome = await provider.search(query, max_results, client, **kwargs)
+    return list(outcome.results)
+
+
+async def _fetch_by_name(
+    name: str,
+    url: str,
+    client: httpx.AsyncClient,
+) -> FetchResult:
+    """Run a single registered fetch provider; return its FetchResult."""
+    try:
+        provider = REGISTRY.get(name)
+    except KeyError as e:
+        return FetchResult(url=url, error=f"no provider registered as {name!r}: {e}")
+    return await provider.fetch(url, client)
 
 
 # --------------------------------------------------------------------------------------
 # Tools
 # --------------------------------------------------------------------------------------
+
 
 @app.tool(
     name="search_web",
@@ -64,8 +109,8 @@ async def search_web(
 ) -> str:
     async with await _new_client() as client:
         brave_res, tavily_res = await asyncio.gather(
-            providers.search_brave(query, max_results, client),
-            providers.search_tavily(query, max_results, client),
+            _search_by_name("brave", query, max_results, client),
+            _search_by_name("tavily", query, max_results, client),
         )
 
     merged = providers.merge_results(brave_res, tavily_res, max_total=max_results * 2)
@@ -74,13 +119,13 @@ async def search_web(
         async with await _new_client() as client:
             top = merged[:3]
             fetched = await asyncio.gather(
-                *(providers.fetch_jina(r.url, client) for r in top),
+                *(_fetch_by_name("jina", r.url, client) for r in top),
                 return_exceptions=True,
             )
         for r, fetched_result in zip(top, fetched):
-            if isinstance(fetched_result, Exception) or fetched_result.get("error"):
+            if isinstance(fetched_result, BaseException) or fetched_result.error:
                 continue
-            content = fetched_result.get("content", "")
+            content = fetched_result.content
             if content:
                 r.snippet = content[:1500].strip()
 
@@ -107,18 +152,18 @@ async def fetch_url(
     url: Annotated[str, Field(description="HTTP(S) URL to fetch")],
 ) -> str:
     async with await _new_client() as client:
-        result = await providers.fetch_jina(url, client)
-    if result.get("error"):
-        return f"Error: {result['error']}"
+        result = await _fetch_by_name("jina", url, client)
+    if result.error:
+        return f"Error: {result.error}"
 
-    title = result.get("title") or url
-    content = result.get("content", "")
-    truncated = result.get("truncated", False)
-    length = result.get("length", len(content))
+    title = result.title or url
+    content = result.content
+    truncated = result.truncated
+    length = result.length
 
     parts = [
         f"# {title}",
-        f"**Source:** {result['url']}",
+        f"**Source:** {result.url}",
         f"**Length:** {length:,} chars" + (" (truncated)" if truncated else ""),
         "",
         "---",
@@ -138,7 +183,7 @@ async def search_wikipedia(
     max_results: Annotated[int, Field(ge=1, le=10, default=5)] = 5,
 ) -> str:
     async with await _new_client() as client:
-        res = await providers.search_wikipedia(query, max_results, client)
+        res = await _search_by_name("wikipedia", query, max_results, client)
     return _format_results(query, res, "wikipedia") if res else f"No Wikipedia results for: {query}"
 
 
@@ -155,7 +200,7 @@ async def search_academic(
     max_results: Annotated[int, Field(ge=1, le=10, default=5)] = 5,
 ) -> str:
     async with await _new_client() as client:
-        res = await providers.search_arxiv(query, max_results, client)
+        res = await _search_by_name("arxiv", query, max_results, client)
     return _format_results(query, res, "arxiv") if res else f"No arXiv results for: {query}"
 
 
@@ -172,7 +217,7 @@ async def search_news(
     max_results: Annotated[int, Field(ge=1, le=20, default=10)] = 10,
 ) -> str:
     async with await _new_client() as client:
-        res = await providers.search_hn(query, max_results, client)
+        res = await _search_by_name("hackernews", query, max_results, client)
     return _format_results(query, res, "hackernews") if res else f"No Hacker News results for: {query}"
 
 
@@ -191,7 +236,7 @@ async def search_stackexchange(
     site: Annotated[str, Field(description="Stack Exchange site slug (default: stackoverflow)")] = "stackoverflow",
 ) -> str:
     async with await _new_client() as client:
-        res = await providers.search_stackexchange(query, max_results, client, site=site)
+        res = await _search_by_name("stackexchange", query, max_results, client, site=site)
     return _format_results(query, res, f"stackexchange:{site}") if res else f"No Stack Exchange/{site} results for: {query}"
 
 
@@ -209,13 +254,14 @@ async def search_scholar_meta(
     max_results: Annotated[int, Field(ge=1, le=10, default=5)] = 5,
 ) -> str:
     async with await _new_client() as client:
-        res = await providers.search_crossref(query, max_results, client)
+        res = await _search_by_name("crossref", query, max_results, client)
     return _format_results(query, res, "crossref") if res else f"No Crossref results for: {query}"
 
 
 # --------------------------------------------------------------------------------------
 # Deep research tools
 # --------------------------------------------------------------------------------------
+
 
 @app.tool(
     name="plan_research",
@@ -259,27 +305,20 @@ async def extract_evidence(
     max_passages: Annotated[int, Field(ge=1, le=10, default=5)] = 5,
 ) -> str:
     async with await _new_client() as client:
-        fetched = await providers.fetch_jina(url, client)
-        if fetched.get("error"):
-            return f"Error fetching {url}: {fetched['error']}"
+        fetched = await _fetch_by_name("jina", url, client)
+        if fetched.error:
+            return f"Error fetching {url}: {fetched.error}"
         evidence = deep_research.extract_evidence(
-            content=fetched.get("content", ""),
+            content=fetched.content,
             question=question,
             max_passages=max_passages,
         )
         canonical = providers._canonical_url(url)
-        # Synthesize a single synthetic citation so callers can reference passages inline
-        fake_citation = {
-            "id": 1,
-            "url": canonical,
-            "title": fetched.get("title") or canonical,
-            "source": "fetch",
-        }
         payload = {
             "url": canonical,
-            "title": fetched.get("title") or canonical,
-            "length": fetched.get("length", 0),
-            "truncated": fetched.get("truncated", False),
+            "title": fetched.title or canonical,
+            "length": fetched.length,
+            "truncated": fetched.truncated,
             "passages": [
                 {
                     "relevance": round(e.relevance, 3),
@@ -344,7 +383,7 @@ async def research(
 # Formatting helper
 # --------------------------------------------------------------------------------------
 
-def _format_results(query: str, results: list[providers.Result], source_label: str) -> str:
+def _format_results(query: str, results: list[Result], source_label: str) -> str:
     lines = [
         f"# Results for: {query}",
         f"**Source:** {source_label} | **Total:** {len(results)}",
