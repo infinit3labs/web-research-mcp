@@ -86,6 +86,7 @@ class Citation:
     published: str | None = None
     fetched_at: str | None = None  # ISO date
     quote_count: int = 0
+    provenance: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -96,6 +97,7 @@ class Citation:
             "published": self.published,
             "fetched_at": self.fetched_at,
             "quotes": self.quote_count,
+            "provenance": self.provenance,
         }
 
 
@@ -509,22 +511,12 @@ async def _gather_search(
 ) -> list[providers.Result]:
     """Fan out across the recommended sources for one sub-question."""
     src_set = set(sq.sources)
-    primary_query = sq.queries[0] if sq.queries else sq.question
+    queries = sq.queries or [sq.question]
     task_specs: list[tuple[str, Any]] = []
-    if "brave" in src_set:
-        task_specs.append(("brave", providers.search_brave(primary_query, max_results, client)))
-    if "tavily" in src_set:
-        task_specs.append(("tavily", providers.search_tavily(primary_query, max_results, client)))
-    if "wikipedia" in src_set:
-        task_specs.append(("wikipedia", providers.search_wikipedia(primary_query, max_results, client)))
-    if "arxiv" in src_set:
-        task_specs.append(("arxiv", providers.search_arxiv(primary_query, max_results, client)))
-    if "hackernews" in src_set:
-        task_specs.append(("hackernews", providers.search_hn(primary_query, max_results, client)))
-    if "stackexchange" in src_set:
-        task_specs.append(("stackexchange", providers.search_stackexchange(primary_query, max_results, client)))
-    if "crossref" in src_set:
-        task_specs.append(("crossref", providers.search_crossref(primary_query, max_results, client)))
+    for query in queries:
+        for provider in providers.provider_registry.providers_for(providers.Capability.SEARCH):
+            if provider.name in src_set:
+                task_specs.append((provider.name, provider.search(query, max_results, client)))
 
     if not task_specs:
         return []
@@ -546,7 +538,8 @@ async def _fetch_and_extract(
     client: httpx.AsyncClient,
 ) -> tuple[providers.Result | None, list[Evidence]]:
     """Fetch one URL and extract evidence relevant to the sub-question."""
-    fetched = await providers.fetch_jina(result.url, client)
+    fetcher = providers.provider_registry.get("jina", providers.Capability.FETCH)
+    fetched = await fetcher.fetch(result.url, client)
     if fetched.get("error") or not fetched.get("content"):
         return None, []
     evidence = extract_evidence(
@@ -603,13 +596,13 @@ async def run_research(
                 per_sq_results[sq.id] = []
 
         # Phase 2: dedup URLs and pick the top N to actually fetch
-        seen_urls: dict[str, providers.Result] = {}
-        for sq in plan.sub_questions:
-            # Pre-populate with search-engine-provided snippets as evidence fallback
-            for r in per_sq_results.get(sq.id, []):
-                canon = providers._canonical_url(r.url)
-                if canon not in seen_urls:
-                    seen_urls[canon] = r
+        # Merge all observations before ranking so duplicate URLs retain the
+        # independent source evidence and the ranking score reflects agreement.
+        merged_results = providers.merge_results(
+            *per_sq_results.values(),
+            max_total=max(30, sum(len(results) for results in per_sq_results.values())),
+        )
+        seen_urls = {providers._canonical_url(r.url): r for r in merged_results}
 
         # Pick which URLs to fetch: top by source-aware composite score.
         # Source weights rebalance Hacker News (high raw scores) against
@@ -665,6 +658,7 @@ async def run_research(
                     source=result.source,
                     published=result.published,
                     fetched_at=today_iso,
+                    provenance=result.extra.get("provenance", []),
                 ))
             cid = url_to_id[canon]
             citations[cid - 1].quote_count += len(evidence)
@@ -688,6 +682,7 @@ async def run_research(
                     published=r.published,
                     fetched_at=today_iso,
                     quote_count=0,
+                    provenance=r.extra.get("provenance", []),
                 ))
                 # Use the search snippet as fallback evidence
                 if r.snippet:

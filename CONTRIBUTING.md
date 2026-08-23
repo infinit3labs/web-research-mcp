@@ -10,7 +10,9 @@ Be kind. Assume good faith. We're all here to build good tools.
 
 1. **Search existing issues** — someone may already be working on it
 2. **For major changes, open an issue first** — describe the problem before proposing the solution
-3. **Run the test suite locally** — `.venv/bin/python tests/e2e_protocol.py` should show 7/7 passing
+3. **Run the deterministic matrix locally** — `.venv/bin/python -m coverage run --branch -m unittest discover -s tests -p 'test_*.py' && .venv/bin/python -m coverage report --show-missing`
+4. **Run the opt-in live protocol smoke suite when network access is available** — `WEB_RESEARCH_RUN_LIVE_INTEGRATION=1 .venv/bin/python -m unittest tests.test_live_protocol`
+5. **Run the full end-to-end protocol check when API/network access is available** — `.venv/bin/python tests/e2e_protocol.py`
 
 ## Coding standards
 
@@ -36,8 +38,12 @@ git clone https://github.com/infinit3labs/web-research-mcp.git
 cd web-research-mcp
 ./bin/web-research-mcp --help   # Just to trigger venv bootstrap, or:
 python3 -m venv .venv
-.venv/bin/pip install -e .
-.venv/bin/python tests/e2e_protocol.py
+.venv/bin/pip install -e ".[test]"
+# Deterministic provider and MCP contract matrix (no network or API keys required)
+.venv/bin/python -m coverage run --branch -m unittest discover -s tests -p 'test_*.py'
+.venv/bin/python -m coverage report --show-missing
+# Optional live smoke suite (requires network access)
+WEB_RESEARCH_RUN_LIVE_INTEGRATION=1 .venv/bin/python -m unittest tests.test_live_protocol
 ```
 
 ## Commit messages

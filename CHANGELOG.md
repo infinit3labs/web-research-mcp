@@ -4,6 +4,11 @@ All notable changes to this project are documented here. Format follows [Keep a 
 
 ## [Unreleased]
 
+### Fixed
+- Execute every planned query for each selected provider in the deep-research pipeline.
+- Synchronize runtime version metadata with the `0.2.0` package release.
+- Refresh tool counts and keyless-tool guidance for the 10-tool server.
+
 ## [0.2.0] — 2026-08-23
 
 ### Added
