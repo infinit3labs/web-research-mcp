@@ -57,11 +57,12 @@ Conventional Commits preferred:
 
 ## Release process
 
-1. Bump version in `pyproject.toml` and `__init__.py`
-2. Move CHANGELOG entry from "Unreleased" to dated version heading
+1. Bump version in `pyproject.toml` and `__init__.py` — `tests/test_packaging.py` fails CI if these two drift apart
+2. Move CHANGELOG entry from "Unreleased" to a dated version heading matching the new version — `tests/test_packaging.py` checks the heading exists
 3. Tag: `git tag -a v0.2.0 -m "Release 0.2.0"`
 4. Push tag: `git push origin v0.2.0`
-5. GitHub Actions (TBD) publishes to PyPI
+5. Cut a GitHub Release from the tag — the `publish` workflow (`.github/workflows/publish.yml`) builds and publishes to PyPI via Trusted Publishing on `release: published`
+6. The `package` job in `.github/workflows/ci.yml` already validates on every push that the build is reproducible (`python -m build` + `twine check`) and that the installed console script speaks the MCP protocol correctly
 
 ## License
 
