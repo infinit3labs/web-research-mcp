@@ -30,6 +30,7 @@ class ProtocolAndSchemaTests(unittest.IsolatedAsyncioTestCase):
         expected = {
             "search_web", "fetch_url", "search_wikipedia", "search_academic", "search_news",
             "search_stackexchange", "search_scholar_meta", "plan_research", "extract_evidence", "research",
+            "synthesize_report", "audit_citations",
         }
         self.assertEqual(set(tools), expected)
         self.assertEqual(tools["search_web"].input_schema["properties"]["max_results"]["maximum"], 30)

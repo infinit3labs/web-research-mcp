@@ -57,7 +57,7 @@ class ProviderParsingTests(unittest.IsolatedAsyncioTestCase):
             results = await providers.search_brave("mcp", 30, client)
 
         self.assertEqual([r.to_dict() for r in results], [
-            {"title": "First", "url": "https://one.test", "snippet": "Snippet", "source": "brave", "score": 1.0, "published": None, "extra": {"age": "1d"}},
+            {"title": "First", "url": "https://one.test", "snippet": "Snippet", "source": "brave", "score": 1.0, "published": "1d", "extra": {"age": "1d"}},
             {"title": "Second", "url": "https://two.test", "snippet": "More", "source": "brave", "score": 2.0, "published": None, "extra": {"age": None}},
         ])
         self.assertEqual(client.calls[0][2]["params"]["count"], 20)
@@ -95,7 +95,8 @@ class ProviderParsingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results[0].title, "A useful paper")
         self.assertEqual(results[0].snippet, "Abstract text")
         self.assertEqual(results[0].published, "2025-06-07")
-        self.assertEqual(results[0].extra["authors"], ["A. Author"])
+        self.assertEqual(results[0].authors, ["A. Author"])
+        self.assertEqual(results[0].publisher, "arXiv")
 
     async def test_hacker_news_uses_story_fallback_url_and_metadata(self):
         client = FakeClient([FakeResponse(json_data={"hits": [{
