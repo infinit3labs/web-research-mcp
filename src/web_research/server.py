@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import sys
 from typing import Annotated
 
@@ -55,8 +54,8 @@ async def _search_by_name(
     max_results: int,
     client: httpx.AsyncClient,
     **kwargs,
-) -> list[Result]:
-    """Run a single registered search provider; return its results or [].
+) -> ProviderOutcome:
+    """Run a single registered search provider; always returns a ProviderOutcome.
 
     A missing/unavailable/erroring provider contributes zero results without
     raising — that's the whole point of the registry. Per-provider stderr
@@ -66,9 +65,23 @@ async def _search_by_name(
         provider = REGISTRY.get(name)
     except KeyError:
         print(f"[web-research] no provider registered as {name!r}", file=sys.stderr, flush=True)
-        return []
-    outcome: ProviderOutcome = await provider.search(query, max_results, client, **kwargs)
-    return list(outcome.results)
+        return ProviderOutcome(provider=name, error=f"no provider registered as {name!r}")
+    return await provider.search(query, max_results, client, **kwargs)
+
+
+def _format_outcome_note(outcomes: list[ProviderOutcome]) -> str:
+    """Render a short note about providers that failed or were rate-limited.
+
+    Providers that were simply unconfigured (no API key) are not called out —
+    that's expected, not a failure worth alarming callers about.
+    """
+    failed = [o for o in outcomes if o.error]
+    if not failed:
+        return ""
+    parts = "; ".join(
+        f"{o.provider} ({'rate limited' if o.rate_limited else 'error'}: {o.error})" for o in failed
+    )
+    return f"\n\n_Note: partial results — {parts}_\n"
 
 
 async def _fetch_by_name(
@@ -107,13 +120,13 @@ async def search_web(
         Field(description="If true, also fetch top 3 results via Jina Reader and append their content snippets."),
     ] = False,
 ) -> str:
+    web_search_providers = REGISTRY.by_capability(providers.Capability.WEB_SEARCH)
     async with await _new_client() as client:
-        brave_res, tavily_res = await asyncio.gather(
-            _search_by_name("brave", query, max_results, client),
-            _search_by_name("tavily", query, max_results, client),
+        outcomes = await asyncio.gather(
+            *(p.search(query, max_results, client) for p in web_search_providers)
         )
 
-    merged = providers.merge_results(brave_res, tavily_res, max_total=max_results * 2)
+    merged = providers.merge_results(*(o.results for o in outcomes), max_total=max_results * 2)
 
     if pro_mode and merged:
         async with await _new_client() as client:
@@ -129,14 +142,18 @@ async def search_web(
             if content:
                 r.snippet = content[:1500].strip()
 
+    note = _format_outcome_note(outcomes)
+
     if not merged:
+        if any(o.error for o in outcomes):
+            return f"No web results.{note}"
         return (
             "No web results. This is likely because no API key is configured — set "
             "BRAVE_API_KEY or TAVILY_API_KEY in your web-research.env. "
             "(Wikipedia, arXiv, HN, Stack Exchange, Crossref, and Jina fetching still work keyless.)"
         )
 
-    return _format_results(query, merged, "search_web")
+    return _format_results(query, merged, "search_web") + note
 
 
 @app.tool(
@@ -183,8 +200,10 @@ async def search_wikipedia(
     max_results: Annotated[int, Field(ge=1, le=10, default=5)] = 5,
 ) -> str:
     async with await _new_client() as client:
-        res = await _search_by_name("wikipedia", query, max_results, client)
-    return _format_results(query, res, "wikipedia") if res else f"No Wikipedia results for: {query}"
+        outcome = await _search_by_name("wikipedia", query, max_results, client)
+    if outcome.error:
+        return f"Error searching Wikipedia: {outcome.error}"
+    return _format_results(query, outcome.results, "wikipedia") if outcome.results else f"No Wikipedia results for: {query}"
 
 
 @app.tool(
@@ -200,8 +219,10 @@ async def search_academic(
     max_results: Annotated[int, Field(ge=1, le=10, default=5)] = 5,
 ) -> str:
     async with await _new_client() as client:
-        res = await _search_by_name("arxiv", query, max_results, client)
-    return _format_results(query, res, "arxiv") if res else f"No arXiv results for: {query}"
+        outcome = await _search_by_name("arxiv", query, max_results, client)
+    if outcome.error:
+        return f"Error searching arXiv: {outcome.error}"
+    return _format_results(query, outcome.results, "arxiv") if outcome.results else f"No arXiv results for: {query}"
 
 
 @app.tool(
@@ -217,8 +238,10 @@ async def search_news(
     max_results: Annotated[int, Field(ge=1, le=20, default=10)] = 10,
 ) -> str:
     async with await _new_client() as client:
-        res = await _search_by_name("hackernews", query, max_results, client)
-    return _format_results(query, res, "hackernews") if res else f"No Hacker News results for: {query}"
+        outcome = await _search_by_name("hackernews", query, max_results, client)
+    if outcome.error:
+        return f"Error searching Hacker News: {outcome.error}"
+    return _format_results(query, outcome.results, "hackernews") if outcome.results else f"No Hacker News results for: {query}"
 
 
 @app.tool(
@@ -236,8 +259,10 @@ async def search_stackexchange(
     site: Annotated[str, Field(description="Stack Exchange site slug (default: stackoverflow)")] = "stackoverflow",
 ) -> str:
     async with await _new_client() as client:
-        res = await _search_by_name("stackexchange", query, max_results, client, site=site)
-    return _format_results(query, res, f"stackexchange:{site}") if res else f"No Stack Exchange/{site} results for: {query}"
+        outcome = await _search_by_name("stackexchange", query, max_results, client, site=site)
+    if outcome.error:
+        return f"Error searching Stack Exchange/{site}: {outcome.error}"
+    return _format_results(query, outcome.results, f"stackexchange:{site}") if outcome.results else f"No Stack Exchange/{site} results for: {query}"
 
 
 @app.tool(
@@ -254,8 +279,10 @@ async def search_scholar_meta(
     max_results: Annotated[int, Field(ge=1, le=10, default=5)] = 5,
 ) -> str:
     async with await _new_client() as client:
-        res = await _search_by_name("crossref", query, max_results, client)
-    return _format_results(query, res, "crossref") if res else f"No Crossref results for: {query}"
+        outcome = await _search_by_name("crossref", query, max_results, client)
+    if outcome.error:
+        return f"Error searching Crossref: {outcome.error}"
+    return _format_results(query, outcome.results, "crossref") if outcome.results else f"No Crossref results for: {query}"
 
 
 # --------------------------------------------------------------------------------------
@@ -413,13 +440,8 @@ def _format_results(query: str, results: list[Result], source_label: str) -> str
 # --------------------------------------------------------------------------------------
 
 async def _run() -> None:
-    has_brave = bool(os.environ.get("BRAVE_API_KEY"))
-    has_tavily = bool(os.environ.get("TAVILY_API_KEY"))
-    has_jina = bool(os.environ.get("JINA_API_KEY"))
-    print(
-        f"[web-research-mcp] starting — brave={has_brave} tavily={has_tavily} jina={has_jina}",
-        file=sys.stderr, flush=True,
-    )
+    status = " ".join(f"{d['name']}={'yes' if d['available'] else 'no'}" for d in REGISTRY.describe())
+    print(f"[web-research-mcp] starting — {status}", file=sys.stderr, flush=True)
     await app.run_stdio_async()
 
 

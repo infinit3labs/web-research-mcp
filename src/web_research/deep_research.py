@@ -19,13 +19,12 @@ import re
 import string
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable
-from urllib.parse import urlparse
+from typing import Any, Iterable
 
 import httpx
 
 from . import providers
-from .providers import REGISTRY, FetchResult, ProviderOutcome, Result
+from .providers import REGISTRY, ProviderOutcome, Result
 
 
 # --------------------------------------------------------------------------------------

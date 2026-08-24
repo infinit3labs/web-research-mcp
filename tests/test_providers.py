@@ -10,6 +10,8 @@ payloads.
 
 from __future__ import annotations
 
+import unittest.mock
+
 import httpx
 import pytest
 
@@ -29,7 +31,6 @@ from src.web_research.providers import (
     StackExchangeProvider,
     TavilyProvider,
     WikipediaProvider,
-    net,
 )
 
 
@@ -105,15 +106,8 @@ async def test_search_provider_translates_provider_error_to_outcome(monkeypatch)
     p = BraveProvider()
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     try:
-        # Stub sleep so retries don't actually wait
-        with __import__("unittest.mock", fromlist=["patch"]).patch(
-            "src.web_research.net.asyncio.sleep",
-            new=__import__("asyncio").sleep,
-        ) if False else __import__("contextlib").nullcontext():
-            # patch sleep to a no-op coroutine
-            import unittest.mock
-            with unittest.mock.patch("src.web_research.net.asyncio.sleep", new=asyncio.coroutine(lambda s: None) if False else unittest.mock.AsyncMock()):
-                outcome = await p.search("x", 5, client)
+        with unittest.mock.patch("src.web_research.net.asyncio.sleep", new=unittest.mock.AsyncMock()):
+            outcome = await p.search("x", 5, client)
         assert outcome.error is not None
         assert outcome.rate_limited is False
         assert outcome.results == []

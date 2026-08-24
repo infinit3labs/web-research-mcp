@@ -1,6 +1,6 @@
 [project]
 name = "deep-web-research-mcp"
-version = "0.2.0"
+version = "0.3.0"
 description = "High-quality multi-source web research MCP server: deep-research pipelines, Wikipedia, arXiv, Hacker News, Stack Exchange, Crossref, Brave, Tavily, and any URL on the web."
 readme = "README.md"
 requires-python = ">=3.10"

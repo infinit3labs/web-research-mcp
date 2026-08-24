@@ -17,6 +17,7 @@ registering it here.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import sys
@@ -25,7 +26,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 
@@ -610,9 +611,12 @@ class JinaFetchProvider(BaseFetchProvider):
         attempt = 0
         while True:
             try:
+                # Note: httpx only accepts `max_redirects` at Client construction,
+                # not per-request — the shared client's default (20) still bounds
+                # the redirect chain, it's just not overridable here.
                 async with client.stream(
                     "GET", jina_url, headers=headers, timeout=self.info.timeout,
-                    follow_redirects=True, max_redirects=5,
+                    follow_redirects=True,
                 ) as response:
                     if response.status_code in net.RETRIABLE_STATUS_CODES:
                         if attempt >= self.info.max_retries:

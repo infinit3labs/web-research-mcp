@@ -309,10 +309,17 @@ The `synthesis_template` is a Markdown skeleton with one section per sub-questio
 ## Testing
 
 ```bash
+# Unit tests — offline, mocked HTTP, no API keys needed
+.venv/bin/pip install -e ".[dev]"
+.venv/bin/python -m pytest tests/ --ignore=tests/e2e_protocol.py
+
+# End-to-end — hits live upstream APIs
 .venv/bin/python tests/e2e_protocol.py
 ```
 
-This launches the actual server, performs a real MCP `initialize` + `tools/list` handshake, then makes live JSON-RPC calls against every tool and verifies that:
+The unit suite (`tests/test_net.py`, `tests/test_providers.py`, `tests/test_deep_research.py`) covers provider response parsing, the capability registry, retry/backoff behavior on timeouts/429/5xx, SSRF URL validation, and the deep-research planning/evidence heuristics — all against mocked HTTP transports, so it runs fast and needs no network or API keys.
+
+The e2e test launches the actual server, performs a real MCP `initialize` + `tools/list` handshake, then makes live JSON-RPC calls against every tool and verifies that:
 
 - Real APIs return real data (not stubs)
 - Each tool's response has the expected shape
@@ -370,9 +377,14 @@ web-research-mcp/
 ├── src/web_research/
 │   ├── __init__.py
 │   ├── server.py                  # MCPServer + 7 @app.tool functions
-│   └── providers.py               # 7 search backends + Result dataclass
+│   ├── providers.py               # Typed provider interface, capability registry, 7 search backends + fetch
+│   ├── net.py                     # Shared retry/backoff + SSRF URL validation
+│   └── deep_research.py           # Plan/evidence/synthesis pipeline
 ├── tests/
-│   └── e2e_protocol.py            # Real subprocess JSON-RPC test
+│   ├── e2e_protocol.py            # Real subprocess JSON-RPC test (live APIs)
+│   ├── test_net.py                # Retry/backoff + SSRF unit tests (mocked HTTP)
+│   ├── test_providers.py          # Provider registry + response-parsing unit tests
+│   └── test_deep_research.py      # Plan/evidence-extraction unit tests
 ├── web-research.env.example       # API key template
 ├── pyproject.toml                 # PEP 621, uv-installable
 ├── README.md
@@ -383,35 +395,48 @@ web-research-mcp/
 
 ### Adding a new tool
 
-1. Add an async function to `providers.py`:
+1. Implement a provider class in `providers.py`, subclassing `BaseSearchProvider` (or `BaseFetchProvider` for a fetch-style source) and register it in `REGISTRY`:
    ```python
-   async def search_my_source(query: str, max_results: int, client: httpx.AsyncClient) -> list[Result]:
-       try:
-           # ... your HTTP call ...
-       except Exception as e:
-           print(f"[my_source] error: {e}", flush=True)
-           return []
-       return [Result(title=..., url=..., snippet=..., source="my_source")]
-   ```
+   class MySourceProvider(BaseSearchProvider):
+       info = ProviderInfo(name="my_source", capability=Capability.WEB_SEARCH, api_key_env="MY_SOURCE_API_KEY")
 
-2. Register it in `server.py`:
+       async def _search_impl(self, query, max_results, client, **kwargs) -> list[Result]:
+           response = await net.request_with_retry(
+               client, "GET", "https://api.my-source.example/search",
+               provider=self.info.name, timeout=self.info.timeout, max_retries=self.info.max_retries,
+               params={"q": query},
+           )
+           data = response.json()
+           return [Result(title=..., url=..., snippet=..., source="my_source") for item in data["items"]]
+
+   REGISTRY.register(MySourceProvider())
+   ```
+   The base class handles the API-key availability check, retries/backoff (via `net.request_with_retry`), and turns any failure into a `ProviderOutcome.error` instead of a raised exception — you only implement the request + response parsing.
+
+2. Register the tool in `server.py`, looking the provider up by name (or by capability, if it should combine with siblings like `search_web` does):
    ```python
    @app.tool(name="search_my_source", description="...", annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True))
    async def search_my_source(query: Annotated[str, Field(description="Search query")], max_results: Annotated[int, Field(ge=1, le=10, default=5)] = 5) -> str:
        async with await _new_client() as client:
-           res = await providers.search_my_source(query, max_results, client)
-       return _format_results(query, res, "my_source") if res else f"No my_source results for: {query}"
+           outcome = await _search_by_name("my_source", query, max_results, client)
+       if outcome.error:
+           return f"Error searching my_source: {outcome.error}"
+       return _format_results(query, outcome.results, "my_source") if outcome.results else f"No my_source results for: {query}"
    ```
 
-3. Add a live test case in `tests/e2e_protocol.py`.
+3. Add unit tests to `tests/test_providers.py` (mock HTTP with `httpx.MockTransport`, no live network).
 
-4. Update the README's Tools section.
+4. Add a live test case in `tests/e2e_protocol.py`.
+
+5. Update the README's Tools section.
 
 ### Coding style
 
 - Python 3.10+, async-first
 - Type hints everywhere; let Pydantic derive the MCP JSON schema
-- Every provider wraps its network call in try/except and degrades to `[]`
+- Providers are classes implementing `BaseSearchProvider`/`BaseFetchProvider`, registered by capability in `providers.REGISTRY` — tool handlers look providers up by name/capability rather than calling them directly
+- HTTP calls go through `net.request_with_retry` (bounded retries + backoff on timeouts/429/5xx); URL-fetching code validates the target with `net.validate_public_url` first (SSRF guard)
+- A provider never raises out of `.search()`/`.fetch()` — failures become a typed `ProviderOutcome`/`FetchResult` with an `error` field
 - Per-call HTTP client (`_new_client()`) — don't share across calls in stdio mode
 
 ---
@@ -420,10 +445,11 @@ web-research-mcp/
 
 PRs welcome. Before opening one:
 
-1. Run the e2e test against a live install: `.venv/bin/python tests/e2e_protocol.py`
-2. Add a test case for any new tool
-3. Keep `providers.py` independent of MCP-specific types — it should be reusable as a plain Python module
-4. Don't add dependencies on headless browsers or proxy rotation — that violates the project's thesis
+1. Run the unit tests: `.venv/bin/python -m pytest tests/ --ignore=tests/e2e_protocol.py`
+2. Run the e2e test against a live install: `.venv/bin/python tests/e2e_protocol.py`
+3. Add a test case for any new tool
+4. Keep `providers.py` independent of MCP-specific types — it should be reusable as a plain Python module
+5. Don't add dependencies on headless browsers or proxy rotation — that violates the project's thesis
 
 For major changes, open an issue first.
 

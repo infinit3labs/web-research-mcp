@@ -13,7 +13,6 @@ Covers:
 from __future__ import annotations
 
 import asyncio
-import socket
 from unittest.mock import AsyncMock, patch
 
 import httpx
