@@ -67,7 +67,7 @@ async def _search_registered_provider(
 ) -> list[providers.Result]:
     started = observability.provider_started(provider.name, "search", query)
     try:
-        results = await provider.search(query, max_results, client, **kwargs)
+        results = await providers.cached_search(provider, query, max_results, client, **kwargs)
     except Exception as exc:
         observability.provider_failed(provider.name, "search", exc)
         observability.provider_finished(provider.name, "search", started, 0, partial=False, status="error")
@@ -116,7 +116,7 @@ async def _fetch_provider(url: str, client: httpx.AsyncClient) -> dict[str, obje
     provider = providers.provider_registry.get("jina", providers.Capability.FETCH)
     started = observability.provider_started(provider.name, "fetch", url)
     try:
-        result = await provider.fetch(url, client)
+        result = await providers.cached_fetch(provider, url, client)
     except Exception as exc:
         observability.provider_failed(provider.name, "fetch", exc)
         observability.provider_finished(provider.name, "fetch", started, 0, partial=False, status="error")

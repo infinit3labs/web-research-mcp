@@ -516,7 +516,7 @@ async def _gather_search(
     for query in queries:
         for provider in providers.provider_registry.providers_for(providers.Capability.SEARCH):
             if provider.name in src_set:
-                task_specs.append((provider.name, provider.search(query, max_results, client)))
+                task_specs.append((provider.name, providers.cached_search(provider, query, max_results, client)))
 
     if not task_specs:
         return []
@@ -539,7 +539,7 @@ async def _fetch_and_extract(
 ) -> tuple[providers.Result | None, list[Evidence]]:
     """Fetch one URL and extract evidence relevant to the sub-question."""
     fetcher = providers.provider_registry.get("jina", providers.Capability.FETCH)
-    fetched = await fetcher.fetch(result.url, client)
+    fetched = await providers.cached_fetch(fetcher, result.url, client)
     if fetched.get("error") or not fetched.get("content"):
         return None, []
     evidence = extract_evidence(

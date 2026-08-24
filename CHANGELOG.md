@@ -8,6 +8,7 @@ All notable changes to this project are documented here. Format follows [Keep a 
 - CI now builds the sdist/wheel, runs `twine check`, installs the wheel into a clean venv, and smoke-tests the installed `web-research-mcp` console script over real MCP stdio (`.github/workflows/ci.yml` `package` job).
 - `tests/test_packaging.py` — deterministic checks that `pyproject.toml` and `__init__.py` versions stay in sync and that `CHANGELOG.md` has a dated heading for the current version.
 - README "Upgrading & rollback" section covering both `pip install` and source-checkout upgrade/rollback paths.
+- In-memory TTL cache (`src/web_research/cache.py`) and per-provider concurrency caps for search/fetch calls, applied uniformly to plain tool calls and the deep-research pipeline via `providers.cached_search`/`cached_fetch`. Configurable via `WEB_RESEARCH_CACHE_TTL_SECONDS`, `WEB_RESEARCH_CACHE_MAX_ENTRIES`, and `WEB_RESEARCH_MAX_CONCURRENCY[_<PROVIDER>]`. Failures and empty results are never cached, and cache hits report zero estimated cost in observability events.
 
 ### Fixed
 - Execute every planned query for each selected provider in the deep-research pipeline.

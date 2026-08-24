@@ -304,6 +304,8 @@ The `synthesis_template` is a Markdown skeleton with one section per sub-questio
 
 **Shared HTTP client per call.** `httpx.AsyncClient` with connection pooling (`max_connections=20`), sane timeouts (`30s` default, `45s` for fetch_url), and automatic redirect following. New client per call because stdio MCP servers process one request at a time and we want clean state.
 
+**Bounded fan-out + result caching.** Every search/fetch call — plain tool calls and the deep-research pipeline alike — goes through `providers.cached_search`/`cached_fetch`. A per-provider semaphore caps concurrent in-flight requests (`WEB_RESEARCH_MAX_CONCURRENCY`, default 4), so a `depth="deep"` research run can't fan out into dozens of simultaneous requests against one upstream. A short-TTL in-memory cache (`WEB_RESEARCH_CACHE_TTL_SECONDS`, default 300s) avoids repeating identical search/fetch calls within one run; failures and empty results are never cached, so a rate-limited provider still gets retried on the next call instead of being "stuck empty" for the TTL window.
+
 **No headless browsers.** Zero Playwright, Selenium, Puppeteer, or proxy rotation. Smaller attack surface, smaller dependencies, no JVM/Chrome footprint. Jina does the heavy lifting on the few sites that need JS rendering.
 
 ---
@@ -381,6 +383,12 @@ the behavior with `WEB_RESEARCH_TIMEOUT_SECONDS`, provider-specific overrides su
 `WEB_RESEARCH_MAX_RETRIES`, `WEB_RESEARCH_RETRY_BACKOFF_SECONDS`, and
 `WEB_RESEARCH_MAX_BACKOFF_SECONDS`. Exhausted 429s are reported as rate-limited;
 multi-source responses identify unavailable providers when partial results remain.
+
+Concurrent fan-out per provider is capped by `WEB_RESEARCH_MAX_CONCURRENCY` (default 4),
+with per-provider overrides such as `WEB_RESEARCH_MAX_CONCURRENCY_JINA`. Search/fetch
+results are cached in-memory for `WEB_RESEARCH_CACHE_TTL_SECONDS` (default 300, set to
+`0` to disable) up to `WEB_RESEARCH_CACHE_MAX_ENTRIES` (default 256) entries; set either
+to `0` to turn caching off entirely.
 
 Each keyless API has its own limits. If you hit them:
 - Wikipedia: ~200 req/min, identify yourself with a real `User-Agent` (this server sends one)

@@ -68,6 +68,9 @@ class ProviderContractTests(unittest.TestCase):
 
 
 class ProviderDispatchTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        providers.reset_caches()
+
     async def test_general_search_dispatches_registered_capability_without_handler_changes(self) -> None:
         class CustomGeneralSearch:
             name = "custom"

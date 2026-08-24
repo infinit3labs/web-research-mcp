@@ -18,6 +18,9 @@ class AsyncClientContext:
 
 
 class McpContractMatrix(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        providers.reset_caches()
+
     async def test_tools_list_has_stable_names_and_machine_readable_schemas(self):
         tools = {tool.name: tool for tool in await server.app.list_tools()}
         expected = {
