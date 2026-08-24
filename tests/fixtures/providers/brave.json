@@ -1,0 +1,12 @@
+{
+  "web": {
+    "results": [
+      {
+        "title": "Model Context Protocol",
+        "url": "https://example.test/mcp",
+        "description": "An open protocol for connecting AI applications to tools.",
+        "age": "1d"
+      }
+    ]
+  }
+}

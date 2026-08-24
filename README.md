@@ -8,7 +8,7 @@
 # One-line install (anywhere on disk)
 git clone https://github.com/infinit3labs/web-research-mcp.git
 hermes mcp add web-research --command "$(pwd)/web-research-mcp/bin/web-research-mcp"
-# 6 of 7 tools work with zero API keys. Add Brave or Tavily to unlock general web search.
+# 9 of 10 tools work with zero API keys. Add Brave or Tavily to unlock general web search.
 ```
 
 ---
@@ -29,7 +29,7 @@ Most "web search" MCP servers try to scrape Google through a headless browser wi
 | Tech signal | Hacker News Algolia API |
 | Code Q&A | Stack Exchange API (any site) |
 
-All seven sources work **without any API keys**. Adding a Brave or Tavily key unlocks real-time general web search. That's the highest-quality approach — you get *better* results than scraping because real web-index APIs use signals (click models, freshness, link analysis) that no scraper can replicate.
+The six vertical providers work **without any API keys**; Brave and Tavily keys unlock real-time general web search. That's the highest-quality approach — you get *better* results than scraping because real web-index APIs use signals (click models, freshness, link analysis) that no scraper can replicate.
 
 ---
 
@@ -52,7 +52,7 @@ hermes mcp add web-research \
   --command "$(pwd)/bin/web-research-mcp"
 ```
 
-When prompted, accept all 7 tools. Done.
+When prompted, accept all 10 tools. Done.
 
 ### Option C — Install with Claude Desktop
 
@@ -254,7 +254,7 @@ The `synthesis_template` is a Markdown skeleton with one section per sub-questio
                      ▼
 ┌─────────────────────────────────────────────────────────┐
 │           web_research.server (MCPServer)                 │
-│  7 tool functions registered via @app.tool() decorator    │
+│  10 tool functions registered via @app.tool() decorator   │
 │  • Pydantic-driven JSON schemas from type hints           │
 │  • Single shared httpx.AsyncClient per call              │
 │  • Graceful degradation: one bad source ≠ failed call    │
@@ -300,7 +300,7 @@ The `synthesis_template` is a Markdown skeleton with one section per sub-questio
 | Academic sources | ✅ arXiv + Crossref | ❌ | ❌ | ⚠️ |
 | Tech/Q&A sources | ✅ HN + StackExchange | ❌ | ❌ | ❌ |
 | Encyclopedic | ✅ Wikipedia | ❌ | ❌ | ⚠️ |
-| Works without API keys | ✅ (6/7 tools) | ❌ | ✅ | ✅ |
+| Works without API keys | ✅ (9/10 tools) | ❌ | ✅ | ✅ |
 | Citation-friendly output | ✅ | ⚠️ | ❌ | ⚠️ |
 | MIT-licensed | ✅ | ⚠️ | ⚠️ | ⚠️ |
 
@@ -319,7 +319,11 @@ This launches the actual server, performs a real MCP `initialize` + `tools/list`
 - Error states are handled gracefully
 - `search_web` without keys returns a clear "set API keys" message
 
-Last run: 7/7 tools pass against live APIs.
+The live subprocess check exercises all 10 registered tools. The deterministic matrix runs separately and covers provider fixtures, failure degradation, generated schemas, and MCP tool-call content contracts without network access:
+
+```bash
+.venv/bin/python -m unittest discover -s tests -p 'test_*.py'
+```
 
 ---
 
@@ -339,7 +343,7 @@ By design — 20k char cap protects your context window. For longer reads, fetch
 
 ### `search_web` returns "No web results. This is likely because no API key is configured"
 
-You need at least one of `BRAVE_API_KEY` or `TAVILY_API_KEY` set in `web-research.env`. The 6 other tools (Wikipedia, arXiv, HN, Stack Exchange, Crossref, fetch_url) all work without keys.
+You need at least one of `BRAVE_API_KEY` or `TAVILY_API_KEY` set in `web-research.env` for general web search. The other 9 tools (including the six vertical providers, `fetch_url`, and the three deep-research tools) work without those keys; `JINA_API_KEY` is optional for higher fetch limits.
 
 ### Stack Exchange returns 400 Bad Request
 
@@ -350,6 +354,15 @@ If you've configured a custom `filter` parameter, the API rejects unknown filter
 Check stderr for the actual traceback. Common cause: Python <3.10. Check with `python3 --version`.
 
 ### Rate limits
+
+Provider calls use bounded retries for transient network errors, HTTP 5xx responses,
+and HTTP 429 responses. A provider that remains unavailable is isolated and returns
+no results, so other sources and deep-research phases can still complete. Configure
+the behavior with `WEB_RESEARCH_TIMEOUT_SECONDS`, provider-specific overrides such as
+`WEB_RESEARCH_TIMEOUT_WIKIPEDIA_SECONDS` or `WEB_RESEARCH_TIMEOUT_JINA_SECONDS`,
+`WEB_RESEARCH_MAX_RETRIES`, `WEB_RESEARCH_RETRY_BACKOFF_SECONDS`, and
+`WEB_RESEARCH_MAX_BACKOFF_SECONDS`. Exhausted 429s are reported as rate-limited;
+multi-source responses identify unavailable providers when partial results remain.
 
 Each keyless API has its own limits. If you hit them:
 - Wikipedia: ~200 req/min, identify yourself with a real `User-Agent` (this server sends one)
@@ -369,7 +382,7 @@ web-research-mcp/
 │   └── web-research-mcp          # Launcher: venv bootstrap + exec
 ├── src/web_research/
 │   ├── __init__.py
-│   ├── server.py                  # MCPServer + 7 @app.tool functions
+│   ├── server.py                  # MCPServer + 10 @app.tool functions
 │   └── providers.py               # 7 search backends + Result dataclass
 ├── tests/
 │   └── e2e_protocol.py            # Real subprocess JSON-RPC test

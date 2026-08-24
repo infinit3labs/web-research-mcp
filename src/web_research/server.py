@@ -6,6 +6,7 @@ Uses the modern mcp.server.mcpserver.MCPServer API (MCP SDK 1.x+).
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import os
 import sys
@@ -16,7 +17,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from . import deep_research, providers
+from . import deep_research, observability, providers
 
 
 app = MCPServer(
@@ -29,6 +30,15 @@ app = MCPServer(
 )
 
 
+def _with_request_context(function):
+    """Ensure all provider events emitted by one MCP tool share one id."""
+    @functools.wraps(function)
+    async def wrapped(*args, **kwargs):
+        with observability.request_context():
+            return await function(*args, **kwargs)
+    return wrapped
+
+
 # Shared HTTP client — module-level so it can be reused across tool calls if the
 # SDK keeps the event loop alive. For stdio transport each call still pays setup.
 async def _new_client() -> httpx.AsyncClient:
@@ -38,6 +48,89 @@ async def _new_client() -> httpx.AsyncClient:
         follow_redirects=True,
         limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
     )
+
+
+async def _search_provider(
+    name: str, query: str, max_results: int, client: httpx.AsyncClient, **kwargs: object
+) -> list[providers.Result]:
+    provider = providers.provider_registry.get(name, providers.Capability.SEARCH)
+    return await _search_registered_provider(provider, query, max_results, client, **kwargs)
+
+
+async def _search_registered_provider(
+    provider: providers.SearchProvider,
+    query: str,
+    max_results: int,
+    client: httpx.AsyncClient,
+    failure_sink: list[str] | None = None,
+    **kwargs: object,
+) -> list[providers.Result]:
+    started = observability.provider_started(provider.name, "search", query)
+    try:
+        results = await provider.search(query, max_results, client, **kwargs)
+    except Exception as exc:
+        observability.provider_failed(provider.name, "search", exc)
+        observability.provider_finished(provider.name, "search", started, 0, partial=False, status="error")
+        if failure_sink is not None:
+            failure_sink.append(provider.name)
+        raise
+    status = observability.provider_finished(
+        provider.name,
+        "search",
+        started,
+        len(results),
+        partial=0 < len(results) < max_results,
+    )
+    if failure_sink is not None and status in {"error", "rate_limited", "partial"}:
+        failure_sink.append(provider.name)
+    return results
+
+
+async def _search_capability(
+    capability: providers.Capability,
+    query: str,
+    max_results: int,
+    client: httpx.AsyncClient,
+    failure_sink: list[str] | None = None,
+    **kwargs: object,
+) -> list[providers.Result]:
+    """Search every configured provider advertising a capability."""
+    selected = providers.provider_registry.providers_for(capability, available_only=True)
+    outcomes = await asyncio.gather(
+        *(
+            _search_registered_provider(
+                provider, query, max_results, client, failure_sink=failure_sink, **kwargs
+            )
+            for provider in selected
+        ),
+        return_exceptions=True,
+    )
+    if failure_sink is not None:
+        for provider, outcome in zip(selected, outcomes):
+            if isinstance(outcome, Exception) and provider.name not in failure_sink:
+                failure_sink.append(provider.name)
+    return [result for outcome in outcomes if isinstance(outcome, list) for result in outcome]
+
+
+async def _fetch_provider(url: str, client: httpx.AsyncClient) -> dict[str, object]:
+    provider = providers.provider_registry.get("jina", providers.Capability.FETCH)
+    started = observability.provider_started(provider.name, "fetch", url)
+    try:
+        result = await provider.fetch(url, client)
+    except Exception as exc:
+        observability.provider_failed(provider.name, "fetch", exc)
+        observability.provider_finished(provider.name, "fetch", started, 0, partial=False, status="error")
+        raise
+    failed = bool(result.get("error"))
+    observability.provider_finished(
+        provider.name,
+        "fetch",
+        started,
+        0 if failed else 1,
+        partial=False,
+        status="error" if failed else "ok",
+    )
+    return result
 
 
 # --------------------------------------------------------------------------------------
@@ -54,6 +147,7 @@ async def _new_client() -> httpx.AsyncClient:
     ),
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
 )
+@_with_request_context
 async def search_web(
     query: Annotated[str, Field(description="Search query")],
     max_results: Annotated[int, Field(ge=1, le=30, default=10)] = 10,
@@ -62,19 +156,23 @@ async def search_web(
         Field(description="If true, also fetch top 3 results via Jina Reader and append their content snippets."),
     ] = False,
 ) -> str:
+    failed_sources: list[str] = []
     async with await _new_client() as client:
-        brave_res, tavily_res = await asyncio.gather(
-            providers.search_brave(query, max_results, client),
-            providers.search_tavily(query, max_results, client),
+        results = await _search_capability(
+            providers.Capability.GENERAL_SEARCH,
+            query,
+            max_results,
+            client,
+            failure_sink=failed_sources,
         )
 
-    merged = providers.merge_results(brave_res, tavily_res, max_total=max_results * 2)
+    merged = providers.merge_results(results, max_total=max_results * 2)
 
     if pro_mode and merged:
         async with await _new_client() as client:
             top = merged[:3]
             fetched = await asyncio.gather(
-                *(providers.fetch_jina(r.url, client) for r in top),
+                *(_fetch_provider(r.url, client) for r in top),
                 return_exceptions=True,
             )
         for r, fetched_result in zip(top, fetched):
@@ -85,13 +183,20 @@ async def search_web(
                 r.snippet = content[:1500].strip()
 
     if not merged:
+        if failed_sources:
+            unavailable = ", ".join(dict.fromkeys(failed_sources))
+            return f"No web results. Partial failure: unavailable providers: {unavailable}."
         return (
             "No web results. This is likely because no API key is configured — set "
             "BRAVE_API_KEY or TAVILY_API_KEY in your web-research.env. "
             "(Wikipedia, arXiv, HN, Stack Exchange, Crossref, and Jina fetching still work keyless.)"
         )
 
-    return _format_results(query, merged, "search_web")
+    formatted = _format_results(query, merged, "search_web")
+    if failed_sources:
+        unavailable = ", ".join(dict.fromkeys(failed_sources))
+        formatted += f"\n**Provider status:** Partial results; unavailable providers: {unavailable}."
+    return formatted
 
 
 @app.tool(
@@ -103,11 +208,12 @@ async def search_web(
     ),
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
 )
+@_with_request_context
 async def fetch_url(
     url: Annotated[str, Field(description="HTTP(S) URL to fetch")],
 ) -> str:
     async with await _new_client() as client:
-        result = await providers.fetch_jina(url, client)
+        result = await _fetch_provider(url, client)
     if result.get("error"):
         return f"Error: {result['error']}"
 
@@ -133,12 +239,13 @@ async def fetch_url(
     description="Search Wikipedia. Returns titles, URLs, and snippets. No API key required.",
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
 )
+@_with_request_context
 async def search_wikipedia(
     query: Annotated[str, Field(description="Search query")],
     max_results: Annotated[int, Field(ge=1, le=10, default=5)] = 5,
 ) -> str:
     async with await _new_client() as client:
-        res = await providers.search_wikipedia(query, max_results, client)
+        res = await _search_provider("wikipedia", query, max_results, client)
     return _format_results(query, res, "wikipedia") if res else f"No Wikipedia results for: {query}"
 
 
@@ -150,12 +257,13 @@ async def search_wikipedia(
     ),
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
 )
+@_with_request_context
 async def search_academic(
     query: Annotated[str, Field(description="Search query")],
     max_results: Annotated[int, Field(ge=1, le=10, default=5)] = 5,
 ) -> str:
     async with await _new_client() as client:
-        res = await providers.search_arxiv(query, max_results, client)
+        res = await _search_provider("arxiv", query, max_results, client)
     return _format_results(query, res, "arxiv") if res else f"No arXiv results for: {query}"
 
 
@@ -167,12 +275,13 @@ async def search_academic(
     ),
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
 )
+@_with_request_context
 async def search_news(
     query: Annotated[str, Field(description="Search query")],
     max_results: Annotated[int, Field(ge=1, le=20, default=10)] = 10,
 ) -> str:
     async with await _new_client() as client:
-        res = await providers.search_hn(query, max_results, client)
+        res = await _search_provider("hackernews", query, max_results, client)
     return _format_results(query, res, "hackernews") if res else f"No Hacker News results for: {query}"
 
 
@@ -185,13 +294,14 @@ async def search_news(
     ),
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
 )
+@_with_request_context
 async def search_stackexchange(
     query: Annotated[str, Field(description="Search query")],
     max_results: Annotated[int, Field(ge=1, le=10, default=5)] = 5,
     site: Annotated[str, Field(description="Stack Exchange site slug (default: stackoverflow)")] = "stackoverflow",
 ) -> str:
     async with await _new_client() as client:
-        res = await providers.search_stackexchange(query, max_results, client, site=site)
+        res = await _search_provider("stackexchange", query, max_results, client, site=site)
     return _format_results(query, res, f"stackexchange:{site}") if res else f"No Stack Exchange/{site} results for: {query}"
 
 
@@ -204,12 +314,13 @@ async def search_stackexchange(
     ),
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
 )
+@_with_request_context
 async def search_scholar_meta(
     query: Annotated[str, Field(description="Search query")],
     max_results: Annotated[int, Field(ge=1, le=10, default=5)] = 5,
 ) -> str:
     async with await _new_client() as client:
-        res = await providers.search_crossref(query, max_results, client)
+        res = await _search_provider("crossref", query, max_results, client)
     return _format_results(query, res, "crossref") if res else f"No Crossref results for: {query}"
 
 
@@ -228,6 +339,7 @@ async def search_scholar_meta(
     ),
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
 )
+@_with_request_context
 async def plan_research(
     question: Annotated[str, Field(description="The research question")],
     depth: Annotated[
@@ -253,13 +365,14 @@ async def plan_research(
     ),
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
 )
+@_with_request_context
 async def extract_evidence(
     url: Annotated[str, Field(description="HTTP(S) URL to read")],
     question: Annotated[str, Field(description="What you're looking for on this page")],
     max_passages: Annotated[int, Field(ge=1, le=10, default=5)] = 5,
 ) -> str:
     async with await _new_client() as client:
-        fetched = await providers.fetch_jina(url, client)
+        fetched = await _fetch_provider(url, client)
         if fetched.get("error"):
             return f"Error fetching {url}: {fetched['error']}"
         evidence = deep_research.extract_evidence(
@@ -309,6 +422,7 @@ async def extract_evidence(
     ),
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
 )
+@_with_request_context
 async def research(
     question: Annotated[str, Field(description="The research question to investigate")],
     depth: Annotated[

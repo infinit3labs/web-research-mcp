@@ -1,0 +1,9 @@
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <title>Attention Is All You Need</title>
+    <summary>We propose a model based on attention mechanisms.</summary>
+    <id>https://arxiv.org/abs/1706.03762</id>
+    <published>2017-06-12T00:00:00Z</published>
+    <author><name>A. Researcher</name></author>
+  </entry>
+</feed>

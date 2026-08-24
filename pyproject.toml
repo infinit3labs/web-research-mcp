@@ -28,6 +28,11 @@ dependencies = [
     "pydantic>=2.5.0",
 ]
 
+[project.optional-dependencies]
+test = [
+    "coverage>=7.4",
+]
+
 [project.urls]
 Homepage = "https://github.com/infinit3labs/web-research-mcp"
 Repository = "https://github.com/infinit3labs/web-research-mcp"

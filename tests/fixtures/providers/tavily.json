@@ -1,0 +1,10 @@
+{
+  "results": [
+    {
+      "title": "Retrieval augmented generation",
+      "url": "https://example.test/rag",
+      "content": "Retrieval augmented generation combines search with generation.",
+      "score": 0.91
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "message": {
+    "items": [
+      {
+        "title": ["A research paper"],
+        "DOI": "10.1234/example",
+        "abstract": "<jats:p>An abstract with <jats:bold>markup</jats:bold>.</jats:p>",
+        "published-print": {"date-parts": [[2024, 3, 2]]},
+        "type": "journal-article",
+        "is-referenced-by-count": 7
+      }
+    ]
+  }
+}
