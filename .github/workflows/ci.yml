@@ -39,6 +39,34 @@ jobs:
           name: coverage-${{ matrix.python-version }}
           path: coverage-${{ matrix.python-version }}.xml
 
+  package:
+    name: Build validation and installed-package smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist + wheel
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+          twine check dist/*
+
+      - name: Install the built wheel into a clean environment
+        run: |
+          python -m venv /tmp/install-check
+          /tmp/install-check/bin/pip install --upgrade pip
+          /tmp/install-check/bin/pip install dist/*.whl
+
+      - name: Smoke test the installed console script over MCP stdio
+        run: |
+          export PATH="/tmp/install-check/bin:$PATH"
+          /tmp/install-check/bin/python -m unittest tests.test_packaging.InstalledConsoleScriptSmokeTest -v
+
   integration:
     name: Opt-in live protocol smoke test
     if: github.event_name == 'workflow_dispatch'

@@ -111,6 +111,24 @@ Ask your agent things like:
 
 ---
 
+## Upgrading & rollback
+
+**pip install:**
+```bash
+pip install --upgrade deep-web-research-mcp   # upgrade to latest
+pip install deep-web-research-mcp==0.1.0      # roll back to a specific version
+```
+Restart your MCP client after changing versions so it re-spawns the server process.
+
+**Source checkout (`bin/web-research-mcp` launcher):**
+```bash
+git pull                              # upgrade to latest main
+git checkout v0.1.0                   # roll back to a tagged release
+```
+The launcher re-syncs `.venv` from `pyproject.toml` on every invocation, so no manual venv rebuild is needed either way. See [CHANGELOG.md](CHANGELOG.md) for what changed between versions.
+
+---
+
 ## Tools
 
 All 10 tools registered in `tools/list`. Tools fall into two layers:

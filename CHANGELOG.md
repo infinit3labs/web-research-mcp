@@ -4,6 +4,11 @@ All notable changes to this project are documented here. Format follows [Keep a 
 
 ## [Unreleased]
 
+### Added
+- CI now builds the sdist/wheel, runs `twine check`, installs the wheel into a clean venv, and smoke-tests the installed `web-research-mcp` console script over real MCP stdio (`.github/workflows/ci.yml` `package` job).
+- `tests/test_packaging.py` — deterministic checks that `pyproject.toml` and `__init__.py` versions stay in sync and that `CHANGELOG.md` has a dated heading for the current version.
+- README "Upgrading & rollback" section covering both `pip install` and source-checkout upgrade/rollback paths.
+
 ### Fixed
 - Execute every planned query for each selected provider in the deep-research pipeline.
 - Synchronize runtime version metadata with the `0.2.0` package release.
