@@ -94,13 +94,14 @@ class CitationProvenanceTests(unittest.TestCase):
         result = providers.Result("short", "https://example.test/page", "snippet", "wikipedia")
 
         with patch.object(providers.provider_registry, "get", return_value=FakeFetcher()):
-            updated_result, evidence = asyncio.run(
+            updated_result, evidence, metadata = asyncio.run(
                 deep_research._fetch_and_extract(result, sq, max_passages=2, client="client")
             )
 
         self.assertEqual(["https://example.test/page"], calls)
         self.assertEqual("A much better canonical title", updated_result.title)
         self.assertIsInstance(evidence, list)
+        self.assertEqual(metadata["fetched_title"], "A much better canonical title")
 
         # Second call for the same URL must be served from providers.cached_fetch
         # without invoking the fake fetcher again.
