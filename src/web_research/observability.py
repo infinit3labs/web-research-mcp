@@ -98,10 +98,26 @@ def provider_finished(
         duration_ms=round((time.perf_counter() - started) * 1000, 2),
         result_count=result_count,
         partial=partial,
-        estimated_cost_usd=_estimated_cost(provider),
+        estimated_cost_usd=0.0 if resolved_status == "cached" else _estimated_cost(provider),
     )
     _provider_status.set(None)
     return resolved_status
+
+
+def provider_cache_hit(provider: str, operation: str, target: str) -> None:
+    """Record that a provider call was served from the in-memory cache.
+
+    Sets the shared status contextvar so a subsequent provider_finished()
+    call reports status="cached" and zeroes out estimated cost — a cache hit
+    never touches the upstream API, so it shouldn't be billed as if it did.
+    """
+    _provider_status.set("cached")
+    emit(
+        "provider.cache_hit",
+        provider=provider,
+        operation=operation,
+        target_fingerprint=_fingerprint(target),
+    )
 
 
 def provider_failed(provider: str, operation: str, exc: BaseException) -> None:

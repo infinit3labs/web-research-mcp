@@ -8,6 +8,7 @@ broken source never sinks the whole research run.
 
 from __future__ import annotations
 
+import copy
 import os
 import re
 import asyncio
@@ -21,6 +22,7 @@ from urllib.parse import parse_qs, unquote, urljoin, urlparse
 import httpx
 
 from . import observability
+from .cache import TTLCache
 from .url_safety import UrlSafetyError, validate_url
 
 
@@ -480,6 +482,98 @@ class ProviderRegistry:
         if available_only:
             configs = tuple(config for config in configs if config.available)
         return configs
+
+
+# --------------------------------------------------------------------------------------
+# Caching and bounded concurrency
+#
+# Every search/fetch call that goes through the provider registry (both plain
+# search_* tools and the deep-research pipeline) is funneled through
+# cached_search/cached_fetch below, so both get the same TTL cache and the
+# same per-provider concurrency cap for free.
+#
+# Cache keys are built only from provider name + query/URL + non-secret
+# kwargs (e.g. Stack Exchange's `site`) — provider functions read API keys
+# from the environment directly, so no credential ever enters a cache key.
+#
+# This is a simple cache, not a request-coalescing one: two concurrent calls
+# that both miss on the same key will both hit the network. That's an
+# accepted tradeoff for keeping this dependency-free and easy to reason about.
+# --------------------------------------------------------------------------------------
+
+_search_cache: TTLCache[list[Result]] = TTLCache(
+    max_entries=_env_int("WEB_RESEARCH_CACHE_MAX_ENTRIES", 256, minimum=0),
+    ttl_seconds=_env_float("WEB_RESEARCH_CACHE_TTL_SECONDS", 300.0, minimum=0.0),
+)
+_fetch_cache: TTLCache[FetchResult] = TTLCache(
+    max_entries=_env_int("WEB_RESEARCH_CACHE_MAX_ENTRIES", 256, minimum=0),
+    ttl_seconds=_env_float("WEB_RESEARCH_CACHE_TTL_SECONDS", 300.0, minimum=0.0),
+)
+_provider_semaphores: dict[str, asyncio.Semaphore] = {}
+
+
+def reset_caches() -> None:
+    """Clear cached search/fetch results. Primarily for test isolation."""
+    _search_cache.clear()
+    _fetch_cache.clear()
+
+
+def _semaphore_for(provider: str) -> asyncio.Semaphore:
+    """Return the per-provider semaphore bounding concurrent in-flight calls.
+
+    Built lazily so the limit reflects WEB_RESEARCH_MAX_CONCURRENCY[_<PROVIDER>]
+    at first use and stays stable afterward — mirrors the module's env-config
+    pattern for timeouts/retries, but concurrency limits (unlike timeouts)
+    need one persistent object for the life of the process.
+    """
+    sem = _provider_semaphores.get(provider)
+    if sem is None:
+        limit = _provider_int("WEB_RESEARCH_MAX_CONCURRENCY", provider, 4, minimum=1, maximum=32)
+        sem = asyncio.Semaphore(limit)
+        _provider_semaphores[provider] = sem
+    return sem
+
+
+def _search_cache_key(provider: str, query: str, max_results: int, kwargs: dict[str, Any]) -> str:
+    extra = "&".join(f"{k}={kwargs[k]!r}" for k in sorted(kwargs))
+    return f"search|{provider}|{query}|{max_results}|{extra}"
+
+
+def _fetch_cache_key(provider: str, url: str) -> str:
+    return f"fetch|{provider}|{_canonical_url(url)}"
+
+
+async def cached_search(
+    provider: SearchProvider, query: str, max_results: int, client: httpx.AsyncClient, **kwargs: Any
+) -> list[Result]:
+    """Cache-aware, concurrency-bounded wrapper around provider.search()."""
+    key = _search_cache_key(provider.name, query, max_results, kwargs)
+    cached = _search_cache.get(key)
+    if cached is not None:
+        observability.provider_cache_hit(provider.name, "search", query)
+        return copy.deepcopy(cached)
+    async with _semaphore_for(provider.name):
+        results = await provider.search(query, max_results, client, **kwargs)
+    # Providers degrade to [] on failure (rate limit, timeout, parse error) rather
+    # than raising — caching that [] would silently suppress retries for the full
+    # TTL even after the upstream recovers. Only cache genuine non-empty results.
+    if results:
+        _search_cache.set(key, copy.deepcopy(results))
+    return results
+
+
+async def cached_fetch(provider: FetchProvider, url: str, client: httpx.AsyncClient) -> FetchResult:
+    """Cache-aware, concurrency-bounded wrapper around provider.fetch()."""
+    key = _fetch_cache_key(provider.name, url)
+    cached = _fetch_cache.get(key)
+    if cached is not None:
+        observability.provider_cache_hit(provider.name, "fetch", url)
+        return copy.deepcopy(cached)
+    async with _semaphore_for(provider.name):
+        result = await provider.fetch(url, client)
+    if not result.get("error"):
+        _fetch_cache.set(key, copy.deepcopy(result))
+    return result
 
 
 # --------------------------------------------------------------------------------------

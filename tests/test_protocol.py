@@ -16,6 +16,12 @@ class AsyncClientContext:
 
 
 class ProtocolAndSchemaTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        # Tool calls go through providers.cached_search/cached_fetch; without a
+        # reset a result cached by one test could leak into another test that
+        # reuses the same query against a different mock.
+        providers.reset_caches()
+
     def test_runtime_version_matches_package_metadata(self):
         self.assertEqual(__version__, "0.2.0")
 

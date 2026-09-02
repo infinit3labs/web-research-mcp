@@ -7,6 +7,9 @@ from web_research.deep_research import Citation
 
 
 class CitationProvenanceTests(unittest.TestCase):
+    def setUp(self):
+        providers.reset_caches()
+
     def test_citation_serialization_keeps_all_sources_for_deduplicated_result(self):
         citation = Citation(
             id=1,
@@ -49,6 +52,42 @@ class CitationProvenanceTests(unittest.TestCase):
             [(name, query) for name, query, _max_results, _client in calls],
         )
         self.assertEqual(4, len(results))
+
+    def test_fetch_and_extract_uses_cached_fetch_and_updates_result_title(self):
+        calls = []
+
+        class FakeFetcher:
+            name = "jina"
+
+            async def fetch(self, url, client):
+                calls.append(url)
+                return {
+                    "url": url,
+                    "title": "A much better canonical title",
+                    "content": "Relevant paragraph about the sub-question topic here, long enough to score.\n\n"
+                               "Another unrelated paragraph that pads the fixture body out further still.",
+                    "truncated": False,
+                    "length": 100,
+                }
+
+        sq = deep_research.SubQuestion(
+            id="sq_1", question="topic", rationale="test", queries=["topic details"], sources=["wikipedia"],
+        )
+        result = providers.Result("short", "https://example.test/page", "snippet", "wikipedia")
+
+        with patch.object(providers.provider_registry, "get", return_value=FakeFetcher()):
+            updated_result, evidence = asyncio.run(
+                deep_research._fetch_and_extract(result, sq, max_passages=2, client="client")
+            )
+
+        self.assertEqual(["https://example.test/page"], calls)
+        self.assertEqual("A much better canonical title", updated_result.title)
+        self.assertIsInstance(evidence, list)
+
+        # Second call for the same URL must be served from providers.cached_fetch
+        # without invoking the fake fetcher again.
+        asyncio.run(deep_research._fetch_and_extract(result, sq, max_passages=2, client="client"))
+        self.assertEqual(["https://example.test/page"], calls)
 
 
 if __name__ == "__main__":

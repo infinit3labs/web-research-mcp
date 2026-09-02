@@ -66,6 +66,7 @@ class ProviderResilienceTests(unittest.TestCase):
             "WEB_RESEARCH_RETRY_BACKOFF_SECONDS": "0",
             "WEB_RESEARCH_MAX_BACKOFF_SECONDS": "0",
         })
+        providers.reset_caches()
 
     def tearDown(self):
         for key, value in self.env.items():
