@@ -4,6 +4,12 @@ All notable changes to this project are documented here. Format follows [Keep a 
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-09-02
+
+### Added
+- Longform synthesis scaffolding with citation auditing and structured report rendering.
+- Tavily advanced search controls, news enrichment, and Extract fallback for Jina failures.
+
 ### Added
 - CI now builds the sdist/wheel, runs `twine check`, installs the wheel into a clean venv, and smoke-tests the installed `web-research-mcp` console script over real MCP stdio (`.github/workflows/ci.yml` `package` job).
 - `tests/test_packaging.py` — deterministic checks that `pyproject.toml` and `__init__.py` versions stay in sync and that `CHANGELOG.md` has a dated heading for the current version.
