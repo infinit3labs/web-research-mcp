@@ -233,6 +233,9 @@ class Result:
     score: float = 0.0
     published: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
+    # Complete citation metadata: author(s) and publisher/venue.
+    authors: list[str] = field(default_factory=list)
+    publisher: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -242,6 +245,8 @@ class Result:
             "source": self.source,
             "score": self.score,
             "published": self.published,
+            **({"authors": list(self.authors)} if self.authors else {}),
+            **({"publisher": self.publisher} if self.publisher else {}),
             **({"extra": self.extra} if self.extra else {}),
         }
 
@@ -260,6 +265,7 @@ class FetchResult(TypedDict, total=False):
     truncated: bool
     length: int
     error: str
+    published: str  # optional; only set when the fetcher can determine it
 
 
 class Capability(str, Enum):
@@ -600,6 +606,7 @@ async def search_brave(query: str, max_results: int, client: httpx.AsyncClient) 
 
     out: list[Result] = []
     for item in data.get("web", {}).get("results", [])[:max_results]:
+        meta = item.get("meta") or {}
         out.append(
             Result(
                 title=item.get("title", "").strip(),
@@ -607,7 +614,10 @@ async def search_brave(query: str, max_results: int, client: httpx.AsyncClient) 
                 snippet=item.get("description", "").strip(),
                 source="brave",
                 score=float(data.get("web", {}).get("results", []).index(item) + 1),
+                published=(item.get("page_age") or item.get("age") or None),
                 extra={"age": item.get("age")},
+                authors=[a.strip() for a in re.split(r"[,;] and |, | and ", meta.get("author", "") or "") if a.strip()],
+                publisher=meta.get("site_name") or meta.get("url") or None,
             )
         )
     return out
@@ -617,21 +627,49 @@ async def search_brave(query: str, max_results: int, client: httpx.AsyncClient) 
 # Tavily (optional, requires TAVILY_API_KEY — research-optimized, returns content)
 # --------------------------------------------------------------------------------------
 
-async def search_tavily(query: str, max_results: int, client: httpx.AsyncClient) -> list[Result]:
+async def search_tavily(
+    query: str,
+    max_results: int,
+    client: httpx.AsyncClient,
+    *,
+    topic: str | None = None,
+    time_range: str | None = None,
+    include_domains: list[str] | None = None,
+    exclude_domains: list[str] | None = None,
+) -> list[Result]:
+    """Search via Tavily's research-optimized API.
+
+    Uses modern Bearer authentication and exposes Tavily's quality levers:
+    ``topic`` (``general``/``news``/``finance``), ``time_range`` recency
+    filter, and domain allow/block lists. Advanced depth plus
+    ``chunks_per_source=3`` yields richer per-URL content than basic search.
+    """
     key = os.environ.get("TAVILY_API_KEY")
     if not key:
         return []
+    payload: dict[str, Any] = {
+        "query": query,
+        # Tavily accepts up to 20 results per request.
+        "max_results": min(max_results, 20),
+        # Advanced depth costs 2 credits but returns multiple semantically
+        # relevant chunks per source — the point of paying for Tavily.
+        "search_depth": "advanced",
+        "chunks_per_source": 3,
+    }
+    if topic:
+        payload["topic"] = topic
+    if time_range:
+        payload["time_range"] = time_range
+    if include_domains:
+        payload["include_domains"] = list(include_domains)[:300]
+    if exclude_domains:
+        payload["exclude_domains"] = list(exclude_domains)[:150]
     try:
         r = await _request(client, "POST",
             "https://api.tavily.com/search",
             provider="tavily",
-            json={
-                "api_key": key,
-                "query": query,
-                "max_results": min(max_results, 10),
-                "include_answer": False,
-                "search_depth": "advanced",
-            },
+            headers={"Authorization": f"Bearer {key}"},
+            json=payload,
             timeout=20.0,
         )
         r.raise_for_status()
@@ -649,6 +687,8 @@ async def search_tavily(query: str, max_results: int, client: httpx.AsyncClient)
                 snippet=item.get("content", "").strip()[:600],
                 source="tavily",
                 score=float(item.get("score", 0)),
+                published=item.get("published_date"),
+                authors=[item["author"]] if item.get("author") else [],
             )
         )
     return out
@@ -695,6 +735,7 @@ async def search_wikipedia(query: str, max_results: int, client: httpx.AsyncClie
                 snippet=snippet,
                 source="wikipedia",
                 score=float(item.get("score", 0)) / 100.0,
+                publisher="Wikipedia",
             )
         )
     return out
@@ -706,13 +747,32 @@ async def search_wikipedia(query: str, max_results: int, client: httpx.AsyncClie
 
 async def search_arxiv(query: str, max_results: int, client: httpx.AsyncClient) -> list[Result]:
     try:
+        # Recency probes (planner-generated) get an AND-tightened query so
+        # keyword-coincidence junk can't ride a submittedDate sort to the top.
+        lowered = query.lower()
+        recency_probe = any(
+            marker in lowered
+            for marker in ("latest developments", "recent", "newest", "2025", "2026")
+        )
+        if recency_probe:
+            # A quoted phrase keeps the newest-first sort topical; loose AND
+            # queries match so broadly that unrelated fresh papers dominate.
+            terms = [w for w in re.findall(r"[a-zA-Z][a-zA-Z0-9\-]{2,}", lowered)
+                     if w not in ("latest", "developments", "recent", "newest", "2025", "2026")]
+            search_query = (
+                f'all:"{" ".join(terms[:2])}"' if len(terms) >= 2 else f"all:{query}"
+            )
+        else:
+            search_query = f"all:{query}"
         r = await _request(client, "GET",
             "https://export.arxiv.org/api/query",
             provider="arxiv",
             params={
-                "search_query": f"all:{query}",
+                "search_query": search_query,
                 "max_results": min(max_results, 10),
-                "sortBy": "relevance",
+                # Recency probes rank newest-first so fresh primary material
+                # surfaces; the quoted phrase keeps that sort topical.
+                "sortBy": "submittedDate" if recency_probe else "relevance",
                 "sortOrder": "descending",
             },
             timeout=20.0,
@@ -743,7 +803,12 @@ async def search_arxiv(query: str, max_results: int, client: httpx.AsyncClient) 
                 snippet=summary[:600],
                 source="arxiv",
                 published=published,
-                extra={"authors": [a.find("a:name", ATOM_NS).text for a in entry.findall("a:author", ATOM_NS) if a.find("a:name", ATOM_NS) is not None]},
+                authors=[
+                    a.find("a:name", ATOM_NS).text
+                    for a in entry.findall("a:author", ATOM_NS)
+                    if a.find("a:name", ATOM_NS) is not None
+                ],
+                publisher="arXiv",
             )
         )
     return out
@@ -783,6 +848,8 @@ async def search_hn(query: str, max_results: int, client: httpx.AsyncClient) -> 
                 score=score,
                 published=hit.get("created_at", "")[:10] if hit.get("created_at") else None,
                 extra={"points": hit.get("points"), "comments": hit.get("num_comments")},
+                authors=[hit["author"]] if hit.get("author") else [],
+                publisher="Hacker News" if url.startswith("https://news.ycombinator.com/") else None,
             )
         )
     return out
@@ -824,11 +891,14 @@ async def search_stackexchange(query: str, max_results: int, client: httpx.Async
                 snippet=re.sub(r"<[^>]+>", "", item.get("excerpt", "")).strip(),
                 source=f"stackexchange:{site}",
                 score=float(item.get("score", 0)),
+                published=item.get("creation_date"),
                 extra={
                     "is_answered": item.get("is_answered"),
                     "answer_count": item.get("answer_count"),
                     "tags": item.get("tags", []),
                 },
+                authors=[item["owner"]["display_name"]] if isinstance(item.get("owner"), dict) and item["owner"].get("display_name") else [],
+                publisher=f"Stack Exchange: {site}",
             )
         )
     return out
@@ -860,14 +930,26 @@ async def search_crossref(query: str, max_results: int, client: httpx.AsyncClien
         # DOI URL is canonical
         url = item.get("URL") or (f"https://doi.org/{item['DOI']}" if item.get("DOI") else "")
         abstract = re.sub(r"<[^>]+>", "", item.get("abstract", "")).strip()
+        container = item.get("container-title", [""])
         if abstract:
             snippet = abstract[:500]
         else:
             # Fallback to container title
-            container = item.get("container-title", [""])[0] if item.get("container-title") else ""
-            snippet = f"Published in: {container}" if container else ""
+            first_container = container[0] if container else ""
+            snippet = f"Published in: {first_container}" if first_container else ""
         published_parts = item.get("published-print", item.get("published-online", item.get("issued", {}))).get("date-parts", [[None]])[0]
-        published = f"{published_parts[0]}-{published_parts[1]:02d}-{published_parts[2]:02d}" if published_parts and published_parts[0] else None
+        # Crossref often emits partial dates ([2024] or [2024, 5]); pad missing
+        # parts instead of raising IndexError, which would kill the whole call.
+        published_parts = list(published_parts or []) + [None] * (3 - len(published_parts or []))
+        p_year, p_month, p_day = published_parts[0], published_parts[1], published_parts[2]
+        if p_year and p_month and p_day:
+            published = f"{p_year}-{p_month:02d}-{p_day:02d}"
+        elif p_year and p_month:
+            published = f"{p_year}-{p_month:02d}"
+        elif p_year:
+            published = str(p_year)
+        else:
+            published = None
         out.append(
             Result(
                 title=title,
@@ -876,6 +958,12 @@ async def search_crossref(query: str, max_results: int, client: httpx.AsyncClien
                 source="crossref",
                 published=published,
                 extra={"doi": item.get("DOI"), "type": item.get("type"), "citations": item.get("is-referenced-by-count", 0)},
+                authors=[
+                    " ".join(part for part in (a.get("given"), a.get("family")) if part)
+                    for a in item.get("author", [])
+                    if a.get("given") or a.get("family")
+                ],
+                publisher=(container[0] if container and container[0] else None) or item.get("publisher"),
             )
         )
     return out
@@ -939,6 +1027,7 @@ async def fetch_jina(url: str, client: httpx.AsyncClient) -> FetchResult:
     # Split it out cleanly for the LLM
     parsed_url = url
     title = ""
+    published_time = None
     body = content
     if content.startswith("Title:"):
         lines = content.split("\n", 5)
@@ -953,6 +1042,7 @@ async def fetch_jina(url: str, client: httpx.AsyncClient) -> FetchResult:
                 break
         title = meta.get("Title", "")
         parsed_url = meta.get("URL Source", parsed_url)
+        published_time = meta.get("Published Time") or None
         try:
             validate_url(parsed_url)
         except UrlSafetyError as exc:
@@ -974,6 +1064,67 @@ async def fetch_jina(url: str, client: httpx.AsyncClient) -> FetchResult:
         "content": body,
         "truncated": truncated,
         "length": len(body),
+        **({"published": published_time} if published_time else {}),
+    }
+
+
+async def fetch_tavily(url: str, client: httpx.AsyncClient) -> FetchResult:
+    """Extract clean page content via the Tavily Extract API.
+
+    Complements Jina Reader: when ``TAVILY_API_KEY`` is configured, pages that
+    defeat Jina (aggressive bot walls, paywalls) can often still be extracted
+    by Tavily's extraction infrastructure. Uses advanced depth and markdown
+    formatting; output is normalized to the same shape as :func:`fetch_jina`.
+    """
+    key = os.environ.get("TAVILY_API_KEY")
+    if not key:
+        return {"url": url, "error": "Tavily Extract requires a TAVILY_API_KEY"}
+    try:
+        validate_url(url)
+    except UrlSafetyError as exc:
+        return {"url": url, "error": f"fetch failed: {exc}"}
+    try:
+        r = await _request(client, "POST",
+            "https://api.tavily.com/extract",
+            provider="tavily",
+            headers={"Authorization": f"Bearer {key}"},
+            json={
+                "urls": [url],
+                # Advanced extraction handles JavaScript-heavy and bot-protected
+                # pages at the cost of 2 credits instead of 1.
+                "extract_depth": "advanced",
+                "format": "markdown",
+            },
+            timeout=min(_request_timeout("jina", FETCH_TIMEOUT_SECONDS), FETCH_TIMEOUT_SECONDS),
+        )
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        return {"url": url, "error": f"fetch failed: {e}"}
+
+    extracted = next((item for item in data.get("results", []) if item.get("raw_content")), None)
+    if extracted is None:
+        failures = data.get("failed_results") or []
+        reason = failures[0].get("error", "") if failures else "no extractable content"
+        return {"url": url, "error": f"extract failed: {reason}"}
+
+    body = extracted.get("raw_content", "")
+    title = (extracted.get("title") or "").strip()
+    published_time = extracted.get("published_time") or None
+
+    # Truncate very long pages to avoid blowing context windows (default 20k chars ≈ 5k tokens)
+    max_chars = 20_000
+    truncated = len(body) > max_chars
+    if truncated:
+        body = body[:max_chars] + f"\n\n[...truncated, full content was {len(extracted.get('raw_content', '')):,} chars]"
+
+    return {
+        "url": extracted.get("url") or url,
+        "title": title,
+        "content": body,
+        "truncated": truncated,
+        "length": len(body),
+        **({"published": published_time} if published_time else {}),
     }
 
 
@@ -982,8 +1133,6 @@ def _build_provider_registry() -> ProviderRegistry:
     for name, capabilities, search_fn, description, api_key_env, requires_api_key in (
         ("brave", frozenset({Capability.SEARCH, Capability.GENERAL_SEARCH}), search_brave,
          "General web search via Brave", "BRAVE_API_KEY", True),
-        ("tavily", frozenset({Capability.SEARCH, Capability.GENERAL_SEARCH}), search_tavily,
-         "Research-optimized general web search via Tavily", "TAVILY_API_KEY", True),
         ("wikipedia", frozenset({Capability.SEARCH}), search_wikipedia,
          "Encyclopedic search via Wikipedia", None, False),
         ("arxiv", frozenset({Capability.SEARCH, Capability.ACADEMIC}), search_arxiv,
@@ -1009,6 +1158,27 @@ def _build_provider_registry() -> ProviderRegistry:
                 ),
             )
         )
+    # Tavily is registered separately: one provider, two capabilities —
+    # research-optimized SEARCH plus page FETCH via Tavily Extract.
+    tavily_capabilities = frozenset({Capability.SEARCH, Capability.GENERAL_SEARCH, Capability.FETCH})
+    registry.register(
+        _FunctionProvider(
+            "tavily",
+            tavily_capabilities,
+            search_fn=search_tavily,
+            fetch_fn=fetch_tavily,
+            config=ProviderConfig(
+                name="tavily",
+                capabilities=tavily_capabilities,
+                description=(
+                    "Research-optimized web search (topics, recency and domain filters) "
+                    "plus page content extraction via Tavily"
+                ),
+                api_key_env="TAVILY_API_KEY",
+                requires_api_key=True,
+            ),
+        )
+    )
     jina_capabilities = frozenset({Capability.FETCH})
     registry.register(
         _FunctionProvider(
@@ -1060,6 +1230,30 @@ def _canonical_url(url: str) -> str:
         return url
 
 
+def _near_duplicate_key(url: str) -> str:
+    """Collapse near-identical URLs that canonicalization alone keeps distinct.
+
+    Beyond the tracking-param/fragment/trailing-slash stripping in
+    ``_canonical_url``, this drops the scheme and ``www.`` prefix, common
+    pagination markers, and trailing file extensions so mirrors of the same
+    article (``http://www.example.com/a/story.html`` vs
+    ``https://example.com/a/story``) collapse to one key. Aggressive by design:
+    it is used for *near*-duplicate detection where collapsing two genuinely
+    distinct pages is cheaper than surfacing the same source twice.
+    """
+    canon = _canonical_url(url)
+    try:
+        p = urlparse(canon)
+        host = re.sub(r"^www\.", "", (p.hostname or "").lower())
+        path = p.path or "/"
+        path = re.sub(r"/(page|p)/\d+(?=/|$)", "", path)
+        path = re.sub(r"\.(html?|php|aspx?|jsp)$", "", path)
+        path = path.rstrip("/")
+        return f"{host}{path}?{sorted(parse_qs(p.query).items())!s}"
+    except ValueError:
+        return canon
+
+
 def merge_results(*result_lists: list[Result], max_total: int = 30) -> list[Result]:
     """Merge results across sources, dedupe by canonical URL, prefer higher-scored entries."""
     seen: dict[str, Result] = {}
@@ -1088,6 +1282,8 @@ def merge_results(*result_lists: list[Result], max_total: int = 30) -> list[Resu
                     score=r.score,
                     published=r.published,
                     extra=dict(r.extra),
+                    authors=list(r.authors),
+                    publisher=r.publisher,
                 )
                 merged.extra["provenance"] = [{"source": r.source, "url": r.url, "score": r.score}]
                 seen[canon] = merged

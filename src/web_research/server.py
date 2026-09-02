@@ -9,6 +9,7 @@ import asyncio
 import functools
 import json
 import os
+import re
 import sys
 from typing import Annotated
 
@@ -17,7 +18,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from . import deep_research, observability, providers
+from . import deep_research, observability, providers, synthesis
 
 
 app = MCPServer(
@@ -133,6 +134,44 @@ async def _fetch_provider(url: str, client: httpx.AsyncClient) -> dict[str, obje
     return result
 
 
+async def _fetch_with_tavily_fallback(url: str, client: httpx.AsyncClient) -> dict[str, object]:
+    """Fetch a page via Jina Reader; on failure retry once via Tavily Extract.
+
+    Tavily's extraction infrastructure often recovers pages behind bot walls
+    or aggressive anti-scraping that defeat Jina. The fallback only runs when
+    ``TAVILY_API_KEY`` is configured; when both paths fail, the returned error
+    reports both so callers can diagnose the block.
+    """
+    result = await _fetch_provider(url, client)
+    if not result.get("error"):
+        return result
+    if not os.environ.get("TAVILY_API_KEY"):
+        return result
+
+    tavily = providers.provider_registry.get("tavily", providers.Capability.FETCH)
+    started = observability.provider_started(tavily.name, "fetch", url)
+    try:
+        fallback = await providers.fetch_tavily(url, client)
+    except Exception as exc:
+        observability.provider_failed(tavily.name, "fetch", exc)
+        observability.provider_finished(tavily.name, "fetch", started, 0, partial=False, status="error")
+        fallback = {"url": url, "error": str(exc)}
+    else:
+        failed = bool(fallback.get("error"))
+        observability.provider_finished(
+            tavily.name,
+            "fetch",
+            started,
+            0 if failed else 1,
+            partial=False,
+            status="error" if failed else "ok",
+        )
+    if fallback.get("error"):
+        combined = f"{result['error']} | Tavily Extract also failed: {fallback['error']}"
+        return {**result, "error": combined}
+    return fallback
+
+
 # --------------------------------------------------------------------------------------
 # Tools
 # --------------------------------------------------------------------------------------
@@ -204,6 +243,8 @@ async def search_web(
     description=(
         "Fetch any URL and return clean markdown content. Uses Jina Reader which handles "
         "JS rendering and bot detection on your behalf, returning readable text. "
+        "If TAVILY_API_KEY is configured, pages that fail via Jina are automatically "
+        "retried through Tavily Extract. "
         "Ideal for reading articles, papers, docs, or blog posts."
     ),
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
@@ -213,7 +254,7 @@ async def fetch_url(
     url: Annotated[str, Field(description="HTTP(S) URL to fetch")],
 ) -> str:
     async with await _new_client() as client:
-        result = await _fetch_provider(url, client)
+        result = await _fetch_with_tavily_fallback(url, client)
     if result.get("error"):
         return f"Error: {result['error']}"
 
@@ -270,8 +311,10 @@ async def search_academic(
 @app.tool(
     name="search_news",
     description=(
-        "Search Hacker News for tech news, discussions, and trending links. "
-        "Returns title, URL, points, comments, and dates. No API key required."
+        "Search Hacker News for tech news, discussions, and trending links, plus — when "
+        "TAVILY_API_KEY is configured — mainstream news coverage from Tavily's news topic "
+        "(recency-filtered to the last week) merged and deduplicated with HN results. "
+        "Returns title, URL, snippet, source, and dates."
     ),
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
 )
@@ -281,8 +324,25 @@ async def search_news(
     max_results: Annotated[int, Field(ge=1, le=20, default=10)] = 10,
 ) -> str:
     async with await _new_client() as client:
-        res = await _search_provider("hackernews", query, max_results, client)
-    return _format_results(query, res, "hackernews") if res else f"No Hacker News results for: {query}"
+        hn_results = await _search_provider("hackernews", query, max_results, client)
+
+        tavily_results: list[providers.Result] = []
+        if os.environ.get("TAVILY_API_KEY"):
+            try:
+                tavily_results = await providers.search_tavily(
+                    query,
+                    max_results,
+                    client,
+                    topic="news",
+                    # Mainstream news moves fast; keep the window tight.
+                    time_range="week",
+                )
+            except Exception as exc:
+                observability.provider_failed("tavily", "search_news_enrichment", exc)
+                tavily_results = []
+
+    merged = providers.merge_results(hn_results, tavily_results, max_total=max_results * 2)
+    return _format_results(query, merged, "hackernews+tavily") if merged else f"No Hacker News results for: {query}"
 
 
 @app.tool(
@@ -411,12 +471,15 @@ async def extract_evidence(
     name="research",
     description=(
         "Run a full deep-research pipeline on a complex question. Decomposes the question "
-        "into sub-questions, fans out across multiple sources (Wikipedia, arXiv, Hacker News, "
-        "Stack Exchange, Crossref, plus Brave/Tavily if keys are configured), fetches the top "
-        "URLs, extracts the most relevant passages, and returns a structured ResearchReport "
-        "containing: the plan, a numbered citation manifest, per-sub-question evidence "
-        "with quotes + character offsets, and a Markdown synthesis template for you to fill in. "
-        "You (the model) should write the narrative synthesis citing the [n] markers; the "
+        "into sub-questions, runs iterative multi-query search per sub-question (a broad framing "
+        "query plus targeted follow-ups on recent developments, evidence, and criticism) across "
+        "multiple sources (Wikipedia, arXiv, Hacker News, Stack Exchange, Crossref, plus Brave/Tavily "
+        "if keys are configured), suppresses near-duplicate sources across queries, fetches the top "
+        "URLs for full-page extraction, and returns a structured ResearchReport containing: the plan, "
+        "a numbered citation manifest with complete metadata (title, authors, publisher/venue, "
+        "publication date, URL, access date), per-sub-question evidence passages each stamped with "
+        "its source's citation_id + character offset, and a Markdown synthesis template for you to "
+        "fill in. You (the model) should write the narrative synthesis citing the [n] markers; the "
         "server does the gathering, not the writing. Use `depth='quick'` for fast overviews, "
         "'standard' for normal research, 'deep' for thorough multi-source investigations."
     ),
@@ -452,6 +515,87 @@ async def research(
         f"---\n\n"
     )
     return header + json.dumps(d, indent=2)
+
+
+# --------------------------------------------------------------------------------------
+# Long-form synthesis tools
+# --------------------------------------------------------------------------------------
+
+@app.tool(
+    name="synthesize_report",
+    description=(
+        "Turn a structured research payload (the JSON returned by the `research` tool) into the "
+        "six-section long-form report scaffold defined by the research-report.v1 agent contract: "
+        "Executive Summary; Concept Deep-Dive (foundational→frontier explanation ladder); Survey of "
+        "Perspectives (steelmannable opposing positions with attribution and an explicit "
+        "disagreement summary, CONFLICTING SOURCES flag where detected); Cutting-Edge Developments "
+        "(last ~24 months, preprint status flagged explicitly); Annotated Bibliography (relevance / "
+        "credibility / date on 100% of references); Source Register (number → entry). Returns JSON "
+        "plus a ready-to-fill Markdown skeleton with writing guardrails. You (the model) write the "
+        "narrative prose citing [n] markers; this tool enforces the structure."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
+)
+@_with_request_context
+async def synthesize_report(
+    research_payload: Annotated[str, Field(description="The JSON output of the `research` tool")],
+) -> str:
+    try:
+        payload = json.loads(research_payload)
+    except json.JSONDecodeError as e:
+        return f"Error: research_payload is not valid JSON: {e}"
+    if not isinstance(payload, dict) or "citations" not in payload:
+        return "Error: research_payload must be the JSON object returned by the `research` tool."
+    scaffold = synthesis.build_longform_scaffold(payload)
+    markdown = synthesis.render_markdown(scaffold)
+    header = (
+        f"# Synthesis scaffold ready ({len(scaffold['sections'])} sections, "
+        f"{len(scaffold['annotated_bibliography'])} annotated references)\n\n"
+        "Write the narrative per the guardrails; every substantive claim needs an [n] marker.\n"
+        "Validate your draft with the `audit_citations` tool before finalizing.\n\n---\n\n"
+    )
+    return header + markdown + "\n\n---\n\n```json\n" + json.dumps(scaffold, indent=2) + "\n```"
+
+
+@app.tool(
+    name="audit_citations",
+    description=(
+        "Audit a drafted report for citation discipline before delivery. Flags every substantive "
+        "sentence lacking an inline [n] reference (with line numbers), rejects references to "
+        "bibliography entries that don't exist when a known-reference list is supplied, and reports "
+        "coverage stats (total inline markers, distinct references used). Use it as the final "
+        "quality gate for the zero-uncited-claims acceptance rule."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
+)
+@_with_request_context
+async def audit_citations_tool(
+    draft: Annotated[str, Field(description="The drafted report text (Markdown)")],
+    known_refs: Annotated[
+        str,
+        Field(description="Optional comma-separated list of valid bibliography numbers, e.g. '1,2,3'"),
+    ] = "",
+) -> str:
+    refs: set[int] | None = None
+    if known_refs.strip():
+        try:
+            refs = {int(part) for part in re.split(r"[,\s]+", known_refs.strip()) if part}
+        except ValueError:
+            return "Error: known_refs must be a comma-separated list of integers."
+    result = synthesis.audit_citations(draft, known_refs=refs)
+    n_uncited = len(result["uncited_claims"])
+    verdict = "PASS" if n_uncited == 0 and not result["unknown_refs"] else "FAIL"
+    lines = [
+        f"# Citation audit: {verdict}",
+        f"- Substantive sentences without [n]: {n_uncited}",
+        f"- Unknown reference numbers: {result['unknown_refs'] or 'none'}",
+        f"- Inline markers total: {result['total_inline_markers']}",
+        f"- Distinct references used: {sorted(result['distinct_refs_used'])}",
+        "",
+    ]
+    for line_no, snippet in result["uncited_claims"]:
+        lines.append(f"  - line {line_no}: {snippet}")
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------------------

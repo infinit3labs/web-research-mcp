@@ -92,7 +92,7 @@ $EDITOR web-research.env
 | Key | What it unlocks | Free tier |
 |---|---|---|
 | `BRAVE_API_KEY` | `search_web` real general-web index | 2,000 queries/month |
-| `TAVILY_API_KEY` | `search_web` + research-optimized snippets | 1,000 queries/month |
+| `TAVILY_API_KEY` | `search_web` + research-optimized snippets, Tavily News in `search_news`, Tavily Extract fallback for `fetch_url` | 1,000 queries/month |
 | `JINA_API_KEY` | Higher fetch rate for `fetch_url` | 1M tokens/month |
 
 The launcher picks up keys from `web-research.env` on every invocation — no restart of your MCP client needed.
@@ -146,7 +146,7 @@ search_web(
     pro_mode: bool = False,      # also fetch top 3 URLs and append excerpts
 ) -> str
 ```
-Backed by **Brave + Tavily** with URL-canonicalization dedup and cross-source score boosting. Requires `BRAVE_API_KEY` and/or `TAVILY_API_KEY`. With no keys, returns a clear message telling you how to enable it.
+Backed by **Brave + Tavily** with URL-canonicalization dedup and cross-source score boosting. Requires `BRAVE_API_KEY` and/or `TAVILY_API_KEY`. With no keys, returns a clear message telling you how to enable it. Tavily runs at **advanced search depth** with `chunks_per_source=3` (multiple relevant excerpts per source) and supports up to 20 results per query.
 
 `pro_mode: true` is the research-killer feature — it runs a normal search, fetches the top 3 results via Jina, and appends the content as the snippet. One call does what would otherwise be `search_web` + 3 × `fetch_url`.
 
@@ -160,6 +160,8 @@ Goes through Jina Reader, which:
 - returns clean markdown with metadata block (`Title:`, `URL Source:`, `Published Time:`)
 - truncates to ~20k chars to protect your context window
 
+**Tavily Extract fallback:** with `TAVILY_API_KEY` configured, pages that fail via Jina (hard bot walls, paywalls) are automatically retried through Tavily Extract at advanced depth with markdown formatting. If both paths fail, you get a combined error naming both providers.
+
 ### `search_wikipedia` — encyclopedic grounding
 ```python
 search_wikipedia(query: str, max_results: int = 5) -> str
@@ -172,11 +174,11 @@ search_academic(query: str, max_results: int = 5) -> str
 ```
 Returns title, authors, abstract snippet, published date, PDF URL. Keyless. Best for CS, physics, math, bio.
 
-### `search_news` — Hacker News signal
+### `search_news` — Hacker News + mainstream news signal
 ```python
 search_news(query: str, max_results: int = 10) -> str
 ```
-Returns title, URL, points, comments, date. Keyless. Best for what's trending in tech right now.
+Searches Hacker News (keyless) and — when `TAVILY_API_KEY` is configured — blends in Tavily's news-topic results from the last week, merged and deduplicated with HN. Best for what's trending in tech right now plus its mainstream coverage.
 
 ### `search_stackexchange` — Q&A from 180+ sites
 ```python

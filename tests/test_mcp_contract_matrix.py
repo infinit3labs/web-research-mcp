@@ -26,6 +26,7 @@ class McpContractMatrix(unittest.IsolatedAsyncioTestCase):
         expected = {
             "search_web", "fetch_url", "search_wikipedia", "search_academic", "search_news",
             "search_stackexchange", "search_scholar_meta", "plan_research", "extract_evidence", "research",
+            "synthesize_report", "audit_citations",
         }
         self.assertEqual(set(tools), expected)
         for name, tool in tools.items():
