@@ -28,7 +28,7 @@ dependencies = [
     "pydantic>=2.5.0",
     # anyio 4.14 currently hangs on stdio pipe reads under the MCP server;
     # keep the release on the last known-good transport implementation.
-    "anyio>=4.9,<4.14",
+    "anyio>=4.9,<4.10",
 ]
 
 [project.optional-dependencies]
