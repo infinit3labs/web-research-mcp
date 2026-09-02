@@ -67,7 +67,7 @@ class ProviderRegistryTests(unittest.TestCase):
             {provider.name for provider in searchers},
             {"brave", "tavily", "wikipedia", "arxiv", "hackernews", "stackexchange", "crossref"},
         )
-        self.assertEqual([provider.name for provider in fetchers], ["jina"])
+        self.assertEqual([provider.name for provider in fetchers], ["tavily", "jina"])
 
 
 class ProviderAdapterTests(unittest.IsolatedAsyncioTestCase):

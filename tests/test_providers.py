@@ -63,7 +63,7 @@ class ProviderParsingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.calls[0][2]["params"]["count"], 20)
         self.assertEqual(client.calls[0][2]["headers"]["X-Subscription-Token"], "secret")
 
-    async def test_tavily_normalizes_and_truncates_content(self):
+    async def test_tavily_uses_bearer_auth_and_default_advanced_depth(self):
         client = FakeClient([FakeResponse(json_data={"results": [{
             "title": "Paper", "url": "https://paper.test", "content": "x" * 700, "score": 0.91,
         }]})])
@@ -72,7 +72,104 @@ class ProviderParsingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].snippet, "x" * 600)
-        self.assertEqual(client.calls[0][2]["json"]["max_results"], 10)
+        method, url, kwargs = client.calls[0]
+        self.assertEqual((method, url), ("POST", "https://api.tavily.com/search"))
+        # Modern auth: Bearer header; the key must not leak into the request body.
+        self.assertEqual(kwargs["headers"]["Authorization"], "Bearer secret")
+        body = kwargs["json"]
+        self.assertNotIn("api_key", body)
+        # max_results honours the caller up to Tavily's ceiling of 20.
+        self.assertEqual(body["max_results"], 20)
+        self.assertEqual(body["search_depth"], "advanced")
+        self.assertEqual(body["chunks_per_source"], 3)
+
+    async def test_tavily_passes_topic_time_range_and_domain_filters(self):
+        client = FakeClient([FakeResponse(json_data={"results": []})])
+        with patch.dict(os.environ, {"TAVILY_API_KEY": "secret"}, clear=False):
+            results = await providers.search_tavily(
+                "gpu prices", 5, client,
+                topic="news", time_range="week",
+                include_domains=["anandtech.com", "tomshardware.com"],
+                exclude_domains=["pinterest.com"],
+            )
+
+        self.assertEqual(results, [])
+        method, url, kwargs = client.calls[0]
+        self.assertEqual(url, "https://api.tavily.com/search")
+        body = kwargs["json"]
+        self.assertEqual(body["topic"], "news")
+        self.assertEqual(body["time_range"], "week")
+        self.assertEqual(body["include_domains"], ["anandtech.com", "tomshardware.com"])
+        self.assertEqual(body["exclude_domains"], ["pinterest.com"])
+
+    async def test_tavily_topic_defaults_to_general_when_unconfigured(self):
+        client = FakeClient([FakeResponse(json_data={"results": []})])
+        with patch.dict(os.environ, {"TAVILY_API_KEY": "secret"}, clear=False):
+            await providers.search_tavily("query", 3, client)
+
+        body = client.calls[0][2]["json"]
+        self.assertNotIn("topic", body)
+        self.assertNotIn("time_range", body)
+        self.assertNotIn("include_domains", body)
+
+    async def test_fetch_tavily_extracts_content_and_normalizes_result(self):
+        client = FakeClient([FakeResponse(json_data={"results": [{
+            "url": "https://example.test",
+            "raw_content": "Clean page content",
+            "title": "Example Page",
+        }]})])
+        with patch.dict(os.environ, {"TAVILY_API_KEY": "secret"}, clear=False), \
+                patch("web_research.providers.validate_url"):
+            result = await providers.fetch_tavily("https://example.test", client)
+
+        method, url, kwargs = client.calls[0]
+        self.assertEqual((method, url), ("POST", "https://api.tavily.com/extract"))
+        # Modern Bearer auth; key never appears in the request body.
+        self.assertEqual(kwargs["headers"]["Authorization"], "Bearer secret")
+        self.assertEqual(kwargs["json"], {
+            "urls": ["https://example.test"],
+            "extract_depth": "advanced",
+            "format": "markdown",
+        })
+        self.assertEqual(result["url"], "https://example.test")
+        self.assertEqual(result["title"], "Example Page")
+        self.assertEqual(result["content"], "Clean page content")
+        self.assertFalse(result["truncated"])
+        self.assertEqual(result["length"], len(result["content"]))
+        self.assertNotIn("error", result)
+
+    async def test_fetch_tavily_truncates_oversized_pages(self):
+        client = FakeClient([FakeResponse(json_data={"results": [{
+            "url": "https://big.test", "raw_content": "y" * 30_000, "title": "Big",
+        }]})])
+        with patch.dict(os.environ, {"TAVILY_API_KEY": "secret"}, clear=False), \
+                patch("web_research.providers.validate_url"):
+            result = await providers.fetch_tavily("https://big.test", client)
+
+        self.assertTrue(result["truncated"])
+        self.assertIn("[...truncated", result["content"])
+        self.assertEqual(result["length"], len(result["content"]))
+
+    async def test_fetch_tavily_returns_error_when_page_not_extracted(self):
+        client = FakeClient([FakeResponse(json_data={"results": [], "failed_results": [
+            {"url": "https://blocked.test", "error": "extraction failed"},
+        ]})])
+        with patch.dict(os.environ, {"TAVILY_API_KEY": "secret"}, clear=False), \
+                patch("web_research.providers.validate_url"):
+            result = await providers.fetch_tavily("https://blocked.test", client)
+
+        self.assertTrue(result["error"])
+        self.assertEqual(result["url"], "https://blocked.test")
+        self.assertNotIn("content", result)
+
+    async def test_fetch_tavily_requires_api_key(self):
+        client = FakeClient([])
+        env = {k: v for k, v in os.environ.items() if k != "TAVILY_API_KEY"}
+        with patch.dict(os.environ, env, clear=True):
+            result = await providers.fetch_tavily("https://example.test", client)
+
+        self.assertIn("TAVILY_API_KEY", result["error"])
+        self.assertEqual(client.calls, [])
 
     async def test_wikipedia_strips_markup_and_builds_canonical_url(self):
         client = FakeClient([FakeResponse(json_data={"query": {"search": [{

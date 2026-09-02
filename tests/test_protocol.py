@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -68,6 +69,113 @@ class ProtocolAndSchemaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["url"], "https://page.test")
         self.assertEqual(payload["title"], "Page")
         self.assertIn("passages", payload)
+
+
+class FetchFallbackTests(unittest.IsolatedAsyncioTestCase):
+
+    async def test_fetch_url_falls_back_to_tavily_when_jina_errors_and_key_present(self):
+        jina = AsyncMock(return_value={"url": "https://walled.test", "error": "fetch failed: bot wall"})
+        tavily = AsyncMock(return_value={
+            "url": "https://walled.test", "title": "Recovered",
+            "content": "Extracted via Tavily.", "length": 21, "truncated": False,
+        })
+        context = AsyncClientContext()
+        with patch.dict(os.environ, {"TAVILY_API_KEY": "secret"}, clear=False), \
+                patch.object(server, "_fetch_provider", jina), \
+                patch.object(providers, "fetch_tavily", tavily), \
+                patch.object(server, "_new_client", AsyncMock(return_value=context)):
+            result = await server.app.call_tool("fetch_url", {"url": "https://walled.test"})
+
+        jina.assert_awaited_once()
+        tavily.assert_awaited_once()
+        self.assertIn("# Recovered", result.content[0].text)
+        self.assertIn("Extracted via Tavily.", result.content[0].text)
+
+    async def test_fetch_url_keeps_jina_error_when_no_tavily_key(self):
+        jina = AsyncMock(return_value={"url": "https://walled.test", "error": "fetch failed: bot wall"})
+        tavily = AsyncMock(return_value={"url": "https://walled.test", "content": "should not be reached"})
+        env = {k: v for k, v in os.environ.items() if k != "TAVILY_API_KEY"}
+        context = AsyncClientContext()
+        with patch.dict(os.environ, env, clear=True), \
+                patch.object(server, "_fetch_provider", jina), \
+                patch.object(providers, "fetch_tavily", tavily), \
+                patch.object(server, "_new_client", AsyncMock(return_value=context)):
+            result = await server.app.call_tool("fetch_url", {"url": "https://walled.test"})
+
+        jina.assert_awaited_once()
+        tavily.assert_not_awaited()
+        self.assertTrue(result.content[0].text.startswith("Error:"))
+
+    async def test_fetch_url_reports_combined_error_when_both_fetchers_fail(self):
+        jina = AsyncMock(return_value={"url": "https://walled.test", "error": "jina down"})
+        tavily = AsyncMock(return_value={"url": "https://walled.test", "error": "tavily extract failed"})
+        context = AsyncClientContext()
+        with patch.dict(os.environ, {"TAVILY_API_KEY": "secret"}, clear=False), \
+                patch.object(server, "_fetch_provider", jina), \
+                patch.object(providers, "fetch_tavily", tavily), \
+                patch.object(server, "_new_client", AsyncMock(return_value=context)):
+            result = await server.app.call_tool("fetch_url", {"url": "https://walled.test"})
+
+        self.assertTrue(result.content[0].text.startswith("Error:"))
+        self.assertIn("jina", result.content[0].text)
+        self.assertIn("tavily", result.content[0].text)
+
+
+class SearchNewsTavilyEnrichmentTests(unittest.IsolatedAsyncioTestCase):
+    """search_news enriches Hacker News with Tavily's news topic when available."""
+
+    async def test_search_news_blends_hackernews_with_tavily_news_results(self):
+        hn = [
+            providers.Result("HN Story A", "https://a.test/story-a", "snippet a", "hackernews", score=10.0),
+            providers.Result("HN Story B", "https://b.test/story-b", "snippet b", "hackernews", score=5.0),
+        ]
+        tav = [
+            providers.Result("Tavily Story C", "https://c.test/story-c", "snippet c", "tavily", score=0.9,
+                             published="2026-08-20"),
+            providers.Result("Shared Story B", "https://b.test/story-b", "longer snippet for story b from Tavily",
+                             "tavily", score=0.8),
+        ]
+        context = AsyncClientContext()
+        with patch.dict(os.environ, {"TAVILY_API_KEY": "secret"}, clear=False), \
+                patch.object(server.providers, "search_hn", AsyncMock(return_value=hn)), \
+                patch.object(server.providers, "search_tavily", AsyncMock(return_value=tav)) as mock_tavily, \
+                patch.object(server, "_new_client", AsyncMock(return_value=context)):
+            result = await server.app.call_tool("search_news", {"query": "mcp protocol", "max_results": 5})
+
+        # Tavily is queried with the news topic and recency window.
+        kwargs = mock_tavily.call_args.kwargs
+        self.assertEqual(kwargs.get("topic"), "news")
+        self.assertEqual(kwargs.get("time_range"), "week")
+
+        text = result.content[0].text
+        self.assertIn("# Results for: mcp protocol", text)
+        self.assertIn("https://c.test/story-c", text)   # Tavily-only result present
+        self.assertIn("https://a.test/story-a", text)   # HN result preserved
+
+    async def test_search_news_still_works_without_tavily_key(self):
+        hn = [providers.Result("Only HN", "https://hn.test/only", "snippet", "hackernews", score=3.0)]
+        env = {k: v for k, v in os.environ.items() if k != "TAVILY_API_KEY"}
+        tavily = AsyncMock(return_value=[providers.Result("X", "https://x.test", "y", "tavily")])
+        context = AsyncClientContext()
+        with patch.dict(os.environ, env, clear=True), \
+                patch.object(server.providers, "search_hn", AsyncMock(return_value=hn)), \
+                patch.object(server.providers, "search_tavily", tavily), \
+                patch.object(server, "_new_client", AsyncMock(return_value=context)):
+            result = await server.app.call_tool("search_news", {"query": "mcp", "max_results": 5})
+
+        tavily.assert_not_awaited()
+        self.assertIn("https://hn.test/only", result.content[0].text)
+
+    async def test_search_news_survives_tavily_failure(self):
+        hn = [providers.Result("Only HN", "https://hn.test/only", "snippet", "hackernews", score=3.0)]
+        context = AsyncClientContext()
+        with patch.dict(os.environ, {"TAVILY_API_KEY": "secret"}, clear=False), \
+                patch.object(server.providers, "search_hn", AsyncMock(return_value=hn)), \
+                patch.object(server.providers, "search_tavily", AsyncMock(side_effect=RuntimeError("boom"))), \
+                patch.object(server, "_new_client", AsyncMock(return_value=context)):
+            result = await server.app.call_tool("search_news", {"query": "mcp", "max_results": 5})
+
+        self.assertIn("https://hn.test/only", result.content[0].text)
 
 
 if __name__ == "__main__":

@@ -134,6 +134,44 @@ async def _fetch_provider(url: str, client: httpx.AsyncClient) -> dict[str, obje
     return result
 
 
+async def _fetch_with_tavily_fallback(url: str, client: httpx.AsyncClient) -> dict[str, object]:
+    """Fetch a page via Jina Reader; on failure retry once via Tavily Extract.
+
+    Tavily's extraction infrastructure often recovers pages behind bot walls
+    or aggressive anti-scraping that defeat Jina. The fallback only runs when
+    ``TAVILY_API_KEY`` is configured; when both paths fail, the returned error
+    reports both so callers can diagnose the block.
+    """
+    result = await _fetch_provider(url, client)
+    if not result.get("error"):
+        return result
+    if not os.environ.get("TAVILY_API_KEY"):
+        return result
+
+    tavily = providers.provider_registry.get("tavily", providers.Capability.FETCH)
+    started = observability.provider_started(tavily.name, "fetch", url)
+    try:
+        fallback = await providers.fetch_tavily(url, client)
+    except Exception as exc:
+        observability.provider_failed(tavily.name, "fetch", exc)
+        observability.provider_finished(tavily.name, "fetch", started, 0, partial=False, status="error")
+        fallback = {"url": url, "error": str(exc)}
+    else:
+        failed = bool(fallback.get("error"))
+        observability.provider_finished(
+            tavily.name,
+            "fetch",
+            started,
+            0 if failed else 1,
+            partial=False,
+            status="error" if failed else "ok",
+        )
+    if fallback.get("error"):
+        combined = f"{result['error']} | Tavily Extract also failed: {fallback['error']}"
+        return {**result, "error": combined}
+    return fallback
+
+
 # --------------------------------------------------------------------------------------
 # Tools
 # --------------------------------------------------------------------------------------
@@ -205,6 +243,8 @@ async def search_web(
     description=(
         "Fetch any URL and return clean markdown content. Uses Jina Reader which handles "
         "JS rendering and bot detection on your behalf, returning readable text. "
+        "If TAVILY_API_KEY is configured, pages that fail via Jina are automatically "
+        "retried through Tavily Extract. "
         "Ideal for reading articles, papers, docs, or blog posts."
     ),
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
@@ -214,7 +254,7 @@ async def fetch_url(
     url: Annotated[str, Field(description="HTTP(S) URL to fetch")],
 ) -> str:
     async with await _new_client() as client:
-        result = await _fetch_provider(url, client)
+        result = await _fetch_with_tavily_fallback(url, client)
     if result.get("error"):
         return f"Error: {result['error']}"
 
@@ -271,8 +311,10 @@ async def search_academic(
 @app.tool(
     name="search_news",
     description=(
-        "Search Hacker News for tech news, discussions, and trending links. "
-        "Returns title, URL, points, comments, and dates. No API key required."
+        "Search Hacker News for tech news, discussions, and trending links, plus — when "
+        "TAVILY_API_KEY is configured — mainstream news coverage from Tavily's news topic "
+        "(recency-filtered to the last week) merged and deduplicated with HN results. "
+        "Returns title, URL, snippet, source, and dates."
     ),
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
 )
@@ -282,8 +324,25 @@ async def search_news(
     max_results: Annotated[int, Field(ge=1, le=20, default=10)] = 10,
 ) -> str:
     async with await _new_client() as client:
-        res = await _search_provider("hackernews", query, max_results, client)
-    return _format_results(query, res, "hackernews") if res else f"No Hacker News results for: {query}"
+        hn_results = await _search_provider("hackernews", query, max_results, client)
+
+        tavily_results: list[providers.Result] = []
+        if os.environ.get("TAVILY_API_KEY"):
+            try:
+                tavily_results = await providers.search_tavily(
+                    query,
+                    max_results,
+                    client,
+                    topic="news",
+                    # Mainstream news moves fast; keep the window tight.
+                    time_range="week",
+                )
+            except Exception as exc:
+                observability.provider_failed("tavily", "search_news_enrichment", exc)
+                tavily_results = []
+
+    merged = providers.merge_results(hn_results, tavily_results, max_total=max_results * 2)
+    return _format_results(query, merged, "hackernews+tavily") if merged else f"No Hacker News results for: {query}"
 
 
 @app.tool(

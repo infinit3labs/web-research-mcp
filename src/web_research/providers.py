@@ -627,21 +627,49 @@ async def search_brave(query: str, max_results: int, client: httpx.AsyncClient) 
 # Tavily (optional, requires TAVILY_API_KEY — research-optimized, returns content)
 # --------------------------------------------------------------------------------------
 
-async def search_tavily(query: str, max_results: int, client: httpx.AsyncClient) -> list[Result]:
+async def search_tavily(
+    query: str,
+    max_results: int,
+    client: httpx.AsyncClient,
+    *,
+    topic: str | None = None,
+    time_range: str | None = None,
+    include_domains: list[str] | None = None,
+    exclude_domains: list[str] | None = None,
+) -> list[Result]:
+    """Search via Tavily's research-optimized API.
+
+    Uses modern Bearer authentication and exposes Tavily's quality levers:
+    ``topic`` (``general``/``news``/``finance``), ``time_range`` recency
+    filter, and domain allow/block lists. Advanced depth plus
+    ``chunks_per_source=3`` yields richer per-URL content than basic search.
+    """
     key = os.environ.get("TAVILY_API_KEY")
     if not key:
         return []
+    payload: dict[str, Any] = {
+        "query": query,
+        # Tavily accepts up to 20 results per request.
+        "max_results": min(max_results, 20),
+        # Advanced depth costs 2 credits but returns multiple semantically
+        # relevant chunks per source — the point of paying for Tavily.
+        "search_depth": "advanced",
+        "chunks_per_source": 3,
+    }
+    if topic:
+        payload["topic"] = topic
+    if time_range:
+        payload["time_range"] = time_range
+    if include_domains:
+        payload["include_domains"] = list(include_domains)[:300]
+    if exclude_domains:
+        payload["exclude_domains"] = list(exclude_domains)[:150]
     try:
         r = await _request(client, "POST",
             "https://api.tavily.com/search",
             provider="tavily",
-            json={
-                "api_key": key,
-                "query": query,
-                "max_results": min(max_results, 10),
-                "include_answer": False,
-                "search_depth": "advanced",
-            },
+            headers={"Authorization": f"Bearer {key}"},
+            json=payload,
             timeout=20.0,
         )
         r.raise_for_status()
@@ -1040,13 +1068,71 @@ async def fetch_jina(url: str, client: httpx.AsyncClient) -> FetchResult:
     }
 
 
+async def fetch_tavily(url: str, client: httpx.AsyncClient) -> FetchResult:
+    """Extract clean page content via the Tavily Extract API.
+
+    Complements Jina Reader: when ``TAVILY_API_KEY`` is configured, pages that
+    defeat Jina (aggressive bot walls, paywalls) can often still be extracted
+    by Tavily's extraction infrastructure. Uses advanced depth and markdown
+    formatting; output is normalized to the same shape as :func:`fetch_jina`.
+    """
+    key = os.environ.get("TAVILY_API_KEY")
+    if not key:
+        return {"url": url, "error": "Tavily Extract requires a TAVILY_API_KEY"}
+    try:
+        validate_url(url)
+    except UrlSafetyError as exc:
+        return {"url": url, "error": f"fetch failed: {exc}"}
+    try:
+        r = await _request(client, "POST",
+            "https://api.tavily.com/extract",
+            provider="tavily",
+            headers={"Authorization": f"Bearer {key}"},
+            json={
+                "urls": [url],
+                # Advanced extraction handles JavaScript-heavy and bot-protected
+                # pages at the cost of 2 credits instead of 1.
+                "extract_depth": "advanced",
+                "format": "markdown",
+            },
+            timeout=min(_request_timeout("jina", FETCH_TIMEOUT_SECONDS), FETCH_TIMEOUT_SECONDS),
+        )
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        return {"url": url, "error": f"fetch failed: {e}"}
+
+    extracted = next((item for item in data.get("results", []) if item.get("raw_content")), None)
+    if extracted is None:
+        failures = data.get("failed_results") or []
+        reason = failures[0].get("error", "") if failures else "no extractable content"
+        return {"url": url, "error": f"extract failed: {reason}"}
+
+    body = extracted.get("raw_content", "")
+    title = (extracted.get("title") or "").strip()
+    published_time = extracted.get("published_time") or None
+
+    # Truncate very long pages to avoid blowing context windows (default 20k chars ≈ 5k tokens)
+    max_chars = 20_000
+    truncated = len(body) > max_chars
+    if truncated:
+        body = body[:max_chars] + f"\n\n[...truncated, full content was {len(extracted.get('raw_content', '')):,} chars]"
+
+    return {
+        "url": extracted.get("url") or url,
+        "title": title,
+        "content": body,
+        "truncated": truncated,
+        "length": len(body),
+        **({"published": published_time} if published_time else {}),
+    }
+
+
 def _build_provider_registry() -> ProviderRegistry:
     registry = ProviderRegistry()
     for name, capabilities, search_fn, description, api_key_env, requires_api_key in (
         ("brave", frozenset({Capability.SEARCH, Capability.GENERAL_SEARCH}), search_brave,
          "General web search via Brave", "BRAVE_API_KEY", True),
-        ("tavily", frozenset({Capability.SEARCH, Capability.GENERAL_SEARCH}), search_tavily,
-         "Research-optimized general web search via Tavily", "TAVILY_API_KEY", True),
         ("wikipedia", frozenset({Capability.SEARCH}), search_wikipedia,
          "Encyclopedic search via Wikipedia", None, False),
         ("arxiv", frozenset({Capability.SEARCH, Capability.ACADEMIC}), search_arxiv,
@@ -1072,6 +1158,27 @@ def _build_provider_registry() -> ProviderRegistry:
                 ),
             )
         )
+    # Tavily is registered separately: one provider, two capabilities —
+    # research-optimized SEARCH plus page FETCH via Tavily Extract.
+    tavily_capabilities = frozenset({Capability.SEARCH, Capability.GENERAL_SEARCH, Capability.FETCH})
+    registry.register(
+        _FunctionProvider(
+            "tavily",
+            tavily_capabilities,
+            search_fn=search_tavily,
+            fetch_fn=fetch_tavily,
+            config=ProviderConfig(
+                name="tavily",
+                capabilities=tavily_capabilities,
+                description=(
+                    "Research-optimized web search (topics, recency and domain filters) "
+                    "plus page content extraction via Tavily"
+                ),
+                api_key_env="TAVILY_API_KEY",
+                requires_api_key=True,
+            ),
+        )
+    )
     jina_capabilities = frozenset({Capability.FETCH})
     registry.register(
         _FunctionProvider(
